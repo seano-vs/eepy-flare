@@ -21,8 +21,8 @@
 
   "vars": {
     // Set these to your league and Sleeper user. Both are public numeric ids.
-    "SLEEPER_LEAGUE_ID": "",
-    "SLEEPER_USER_ID": "",
+    "SLEEPER_LEAGUE_ID": "1378157554336559104",
+    "SLEEPER_USER_ID": "1378168866642878464",
     // Comma-separated custom domains serving /mcp (leave empty for *.workers.dev).
     "ALLOWED_HOSTNAMES": "",
 
