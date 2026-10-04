@@ -10,10 +10,10 @@
   // Full NFL players dump, compacted. Refreshed once a day by the cron below.
   // Create with `npx wrangler kv namespace create PLAYERS` and paste the id here.
   "kv_namespaces": [
-    { "binding": "PLAYERS", "id": "REPLACE_WITH_PLAYERS_KV_ID" },
+    { "binding": "PLAYERS", "id": "534337dfad3a401793cd9a740821bd49" },
     // OAuth clients, grants and tokens (phase 2 only; unused while AUTH_MODE is "none").
     // Create with `npx wrangler kv namespace create OAUTH_KV`.
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_ID" }
+    { "binding": "OAUTH_KV", "id": "22a20c308259487a89174b7b235ae334" }
   ],
 
   // Sleeper asks that /players/nfl be fetched at most once per day.
