@@ -1,6 +1,6 @@
 # Copy to .dev.vars for local development (overrides wrangler.jsonc vars).
-SLEEPER_LEAGUE_ID=""
-SLEEPER_USER_ID=""
+# SLEEPER_LEAGUE_ID=""   # only to override wrangler.jsonc
+# SLEEPER_USER_ID=""
 
 # wrangler.jsonc enables OAuth (AUTH_MODE="github"). To test locally without logging in:
 AUTH_MODE="none"
