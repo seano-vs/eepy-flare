@@ -1,3 +1,10 @@
 # Copy to .dev.vars for local development (overrides wrangler.jsonc vars).
 SLEEPER_LEAGUE_ID=""
 SLEEPER_USER_ID=""
+
+# Phase 2 (OAuth with GitHub login). Use the *local* GitHub OAuth app's credentials.
+# AUTH_MODE="github"
+# ALLOWED_GITHUB_USERS="your-github-login"
+# GITHUB_CLIENT_ID=""
+# GITHUB_CLIENT_SECRET=""
+# COOKIE_ENCRYPTION_KEY=""

@@ -3,13 +3,17 @@
   "name": "eepy-flare",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
-  "compatibility_flags": ["nodejs_compat"],
+  // global_fetch_strictly_public: required by the OAuth provider for Client ID Metadata Documents (phase 2).
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "observability": { "enabled": true },
 
   // Full NFL players dump, compacted. Refreshed once a day by the cron below.
   // Create with `npx wrangler kv namespace create PLAYERS` and paste the id here.
   "kv_namespaces": [
-    { "binding": "PLAYERS", "id": "REPLACE_WITH_PLAYERS_KV_ID" }
+    { "binding": "PLAYERS", "id": "REPLACE_WITH_PLAYERS_KV_ID" },
+    // OAuth clients, grants and tokens (phase 2 only; unused while AUTH_MODE is "none").
+    // Create with `npx wrangler kv namespace create OAUTH_KV`.
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_ID" }
   ],
 
   // Sleeper asks that /players/nfl be fetched at most once per day.
@@ -20,6 +24,12 @@
     "SLEEPER_LEAGUE_ID": "",
     "SLEEPER_USER_ID": "",
     // Comma-separated custom domains serving /mcp (leave empty for *.workers.dev).
-    "ALLOWED_HOSTNAMES": ""
+    "ALLOWED_HOSTNAMES": "",
+
+    // "none" = authless (phase 1). "github" = OAuth 2.1 with GitHub login (phase 2); also set the
+    // secrets GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and COOKIE_ENCRYPTION_KEY.
+    "AUTH_MODE": "none",
+    // GitHub logins and/or numeric user ids allowed to sign in (phase 2). Empty = nobody.
+    "ALLOWED_GITHUB_USERS": ""
   }
 }

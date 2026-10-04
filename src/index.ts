@@ -1,19 +1,30 @@
 import { localhostAllowedOrigins } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
+import { authMode, oauthProviderFor } from "./auth";
 import { refreshPlayers } from "./players";
 import { SERVER_NAME, SERVER_VERSION, createServer } from "./tools";
 
+// Stateless Streamable HTTP: a fresh MCP server per request, no Durable Object.
+function mcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	return createMcpHandler(() => createServer(env), mcpOptions(env, new URL(request.url)))(request, env, ctx);
+}
+
+function site(request: Request, env: Env): Response {
+	const url = new URL(request.url);
+	if (url.pathname === "/" || url.pathname === "/health") {
+		return Response.json({ name: SERVER_NAME, version: SERVER_VERSION, mcp: `${url.origin}/mcp`, auth: authMode(env) });
+	}
+	return new Response("Not found", { status: 404 });
+}
+
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		const url = new URL(request.url);
-		if (url.pathname === "/mcp") {
-			// Stateless Streamable HTTP: a fresh MCP server per request, no Durable Object.
-			return createMcpHandler(() => createServer(env), mcpOptions(env, url))(request, env, ctx);
+		if (authMode(env) === "github") {
+			// Phase 2: OAuth 2.1 (GitHub login, allowlisted) in front of /mcp.
+			return oauthProviderFor(new URL(request.url).origin, mcp, site).fetch(request, env, ctx);
 		}
-		if (url.pathname === "/" || url.pathname === "/health") {
-			return Response.json({ name: SERVER_NAME, version: SERVER_VERSION, mcp: `${url.origin}/mcp` });
-		}
-		return new Response("Not found", { status: 404 });
+		if (new URL(request.url).pathname === "/mcp") return mcp(request, env, ctx);
+		return site(request, env);
 	},
 
 	// Daily cron: refresh the players cache (Sleeper asks for at most one /players/nfl fetch per day).

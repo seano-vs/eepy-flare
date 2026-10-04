@@ -85,14 +85,16 @@ npx wrangler login
 - **League ID:** the number in your league's URL, `https://sleeper.com/leagues/<LEAGUE_ID>/…`.
 - **User ID:** run `curl https://api.sleeper.app/v1/user/<your_username>` and take `user_id`.
 
-### 2. Create the KV namespace
+### 2. Create the KV namespaces
 
 ```sh
 npx wrangler kv namespace create PLAYERS
+npx wrangler kv namespace create OAUTH_KV    # only used in phase 2, but the binding must exist
 ```
 
-Paste the returned `id` into `wrangler.jsonc`, replacing `REPLACE_WITH_PLAYERS_KV_ID`. Answer
-**no** if Wrangler offers to add the binding for you, because it's already in the file.
+Paste each returned `id` into `wrangler.jsonc`, replacing `REPLACE_WITH_PLAYERS_KV_ID` and
+`REPLACE_WITH_OAUTH_KV_ID`. Answer **no** if Wrangler offers to add the bindings for you, because
+they're already in the file.
 
 ### 3. Set the vars
 
@@ -159,7 +161,58 @@ In claude.ai, open **Settings → Connectors → Add custom connector** and past
 `https://eepy-flare.<your-subdomain>.workers.dev/mcp`. The connector syncs to the mobile apps.
 
 Phase 1 is authless because all Sleeper data is public. Anyone with the URL can read your league
-through the server, but nothing can be changed.
+through the server, but nothing can be changed. Phase 2 below puts a login in front of it.
+
+## Phase 2: OAuth 2.1 with GitHub login
+
+When `AUTH_MODE` is `"github"`, the Worker becomes its own OAuth 2.1 authorization server, built on
+[`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider), and
+`/mcp` requires a bearer token. claude.ai can't send a static header, so it runs the standard MCP
+auth flow:
+
+1. `POST /mcp` without a token returns `401` with
+   `WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"`.
+2. claude.ai reads the protected resource metadata (RFC 9728), then
+   `/.well-known/oauth-authorization-server` (RFC 8414).
+3. claude.ai registers itself, through dynamic client registration at `/register` (RFC 7591) or a
+   Client ID Metadata Document, and starts `/authorize` with PKCE S256.
+4. You see a consent page showing the client's name and where tokens will go. Click **Allow**.
+5. You sign in with GitHub. The callback accepts only accounts listed in `ALLOWED_GITHUB_USERS`;
+   anyone else is sent back with `access_denied`.
+6. claude.ai exchanges the code at `/token` for a 1-hour access token and a refresh token. The
+   allowlist is checked again on every `/mcp` call, so removing someone takes effect immediately.
+
+The GitHub token is used once to read your login and is never stored. CSRF protection, browser-bound
+one-time `state`, frame blocking and escaping on the consent page all come from the library's
+consent and upstream helpers.
+
+### Setup
+
+1. **Create two GitHub OAuth apps** at <https://github.com/settings/developers> (**OAuth Apps → New**):
+   - Local: homepage `http://localhost:8787`, callback `http://localhost:8787/callback`
+   - Production: homepage `https://eepy-flare.<subdomain>.workers.dev`, callback
+     `https://eepy-flare.<subdomain>.workers.dev/callback`
+2. **Set the secrets** for production:
+   ```sh
+   npx wrangler secret put GITHUB_CLIENT_ID
+   npx wrangler secret put GITHUB_CLIENT_SECRET
+   npx wrangler secret put COOKIE_ENCRYPTION_KEY   # e.g. `openssl rand -hex 32`; remembers consent for 30 days
+   ```
+   For local dev, put the same three names in `.dev.vars`, using the local app's ID and secret.
+3. **Set the vars** in `wrangler.jsonc`:
+   ```jsonc
+   "AUTH_MODE": "github",
+   "ALLOWED_GITHUB_USERS": "your-github-login"   // comma-separated logins and/or numeric user ids
+   ```
+   An empty allowlist lets nobody in. A numeric ID still matches after a username change.
+4. Run `npm run deploy`. In claude.ai, remove the old connector and add the same `/mcp` URL again.
+   claude.ai detects that the server needs auth and opens the login.
+
+To switch back to authless, set `AUTH_MODE` to `"none"`. If you use GitHub Enterprise Server, set
+`GITHUB_URL` and `GITHUB_API_URL` as secrets.
+
+To test locally, run `npm run dev` with the phase 2 values in `.dev.vars`. In MCP Inspector, open
+**Auth Settings → Quick OAuth Flow** and connect to `http://localhost:8787/mcp`.
 
 ## Plan limits
 
@@ -182,12 +235,14 @@ serve `/mcp` from a custom domain, add it to `ALLOWED_HOSTNAMES`.
 
 ```sh
 npm run typecheck
-npm test                 # vitest: scoring, replacement level, lineup optimizer, name resolution
+npm test                 # vitest: scoring, replacement level, lineup optimizer, name resolution, allowlist
 ```
 
 | Path | Purpose |
 | --- | --- |
-| `src/index.ts` | Worker entry: `/mcp`, `/health`, and the cron handler |
+| `src/index.ts` | Worker entry: `/mcp`, `/health`, the cron handler, and the auth mode switch |
+| `src/auth.ts` | Phase 2 OAuth provider, consent page and GitHub login |
+| `src/auth-config.ts` | `AUTH_MODE` and the GitHub allowlist check |
 | `src/tools.ts` | MCP server factory and all tool definitions |
 | `src/league.ts` | League context: config, rosters, owners, team lookup |
 | `src/scoring.ts` | League scoring, projections parsing, replacement level, VOR, lineup optimizer |
