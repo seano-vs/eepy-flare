@@ -1,0 +1,35 @@
+{
+  "name": "eepy-flare",
+  "version": "1.0.0",
+  "description": "Sleeper fantasy football MCP server on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "seed-players": "node scripts/seed-players.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seano-vs/eepy-flare.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/seano-vs/eepy-flare/issues"
+  },
+  "homepage": "https://github.com/seano-vs/eepy-flare#readme",
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "^0.26.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.147.0"
+  },
+  "private": true,
+  "type": "module"
+}

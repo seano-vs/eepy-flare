@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "eepy-flare",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Full NFL players dump, compacted. Refreshed once a day by the cron below.
+  // Create with `npx wrangler kv namespace create PLAYERS` and paste the id here.
+  "kv_namespaces": [
+    { "binding": "PLAYERS", "id": "REPLACE_WITH_PLAYERS_KV_ID" }
+  ],
+
+  // Sleeper asks that /players/nfl be fetched at most once per day.
+  "triggers": { "crons": ["17 9 * * *"] },
+
+  "vars": {
+    // Set these to your league and Sleeper user. Both are public numeric ids.
+    "SLEEPER_LEAGUE_ID": "",
+    "SLEEPER_USER_ID": "",
+    // Comma-separated custom domains serving /mcp (leave empty for *.workers.dev).
+    "ALLOWED_HOSTNAMES": ""
+  }
+}
