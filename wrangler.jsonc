@@ -24,7 +24,7 @@
     "SLEEPER_LEAGUE_ID": "1378157554336559104",
     "SLEEPER_USER_ID": "1378168866642878464",
     // Comma-separated custom domains serving /mcp (leave empty for *.workers.dev).
-    "ALLOWED_HOSTNAMES": "",
+    "ALLOWED_HOSTNAMES": "eepy.seance.sh",
 
     // "none" = authless (phase 1). "github" = OAuth 2.1 with GitHub login (phase 2); also set the
     // secrets GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and COOKIE_ENCRYPTION_KEY.
