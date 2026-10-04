@@ -160,6 +160,14 @@ export const sleeper = {
 				.join("&")}`,
 			1800,
 		),
+	/** Undocumented: season-long projections (incl. ADP such as adp_dynasty_2qb) per player. ~3 MB. */
+	seasonProjections: (season: string, seasonType: string, positions: readonly string[]) =>
+		getJson<unknown>(
+			`${SLEEPER_APP}/projections/nfl/${enc(season)}?season_type=${enc(seasonType)}&${positions
+				.map((p) => `position[]=${enc(p)}`)
+				.join("&")}`,
+			3600,
+		),
 	/** Undocumented: one player's projections for every week of a season, keyed by week. */
 	playerProjections: (playerId: string, season: string, seasonType: string) =>
 		getJson<unknown>(

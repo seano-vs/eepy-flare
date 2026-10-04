@@ -2,9 +2,10 @@
 SLEEPER_LEAGUE_ID=""
 SLEEPER_USER_ID=""
 
-# Phase 2 (OAuth with GitHub login). Use the *local* GitHub OAuth app's credentials.
-# AUTH_MODE="github"
-# ALLOWED_GITHUB_USERS="your-github-login"
+# wrangler.jsonc enables OAuth (AUTH_MODE="github"). To test locally without logging in:
+AUTH_MODE="none"
+
+# To test OAuth locally instead, remove the line above and use the *local* GitHub OAuth app:
 # GITHUB_CLIENT_ID=""
 # GITHUB_CLIENT_SECRET=""
 # COOKIE_ENCRYPTION_KEY=""

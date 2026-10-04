@@ -13,6 +13,7 @@ import {
 	type ProjectedEntry,
 	type Replacement,
 } from "./scoring";
+import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
 
 export const SERVER_NAME = "sleeper-fantasy";
@@ -450,7 +451,12 @@ export function createServer(env: Env): McpServer {
 	async function valuations(lc: LeagueContext, queries: string[], week: number | undefined, includeWeeks: boolean) {
 		const w = week ?? lc.week;
 		const through = lastFantasyWeek(lc.league);
-		const { pool, repl } = await replacementFor(lc, w);
+		const dynasty = isDynasty(lc.league);
+		const [{ pool, repl }, adp] = await Promise.all([
+			replacementFor(lc, w),
+			dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>),
+		]);
+		const hasAdp = Object.keys(adp).length > 0;
 		const owned = lc.ownership();
 		const ranks = positionRanks(pool);
 		const players = queries.map((q) => lc.players.resolve(q));
@@ -473,10 +479,12 @@ export function createServer(env: Env): McpServer {
 			player: fmt(p),
 			id: p.id,
 			league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
+			...(p.age ? { age: p.age } : {}),
 			...(ranks.has(p.id) ? { week_pos_rank: ranks.get(p.id) } : {}),
 			...(vals[i] ?? { projection: "unavailable" }),
+			...(hasAdp ? { dynasty_adp: adp[p.id] ?? null, dynasty_value: dynastyValue(adp[p.id]) } : {}),
 		}));
-		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players };
+		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp };
 	}
 
 	server.registerTool(
@@ -513,7 +521,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Compare players",
 			description:
-				"Compare 2-8 players under this league's scoring: this week's projection (start/sit) and rest-of-season points and value over replacement (trade/hold value).",
+				"Compare 2-8 players under this league's scoring: this week's projection (start/sit), rest-of-season points and value over replacement, and in dynasty leagues long-term value from Sleeper dynasty ADP.",
 			inputSchema: z.object({
 				players: z.array(z.string()).min(2).max(8).describe("Names or Sleeper ids."),
 				week: weekArg,
@@ -533,6 +541,9 @@ export function createServer(env: Env): McpServer {
 					players: v.rows,
 					best_this_week: byWeek[0]?.player,
 					best_rest_of_season: byRos[0]?.player,
+					...(v.dynasty
+						? { best_dynasty: [...v.rows].sort((a, b) => num(b, "dynasty_value") - num(a, "dynasty_value"))[0]?.player }
+						: {}),
 				});
 			} catch (e) {
 				return fail(e);
@@ -545,7 +556,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Evaluate trade",
 			description:
-				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams.",
+				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (Sleeper dynasty ADP) and gives separate win-now and long-term verdicts.",
 			inputSchema: z.object({
 				give: z.array(z.string()).min(1).max(8).describe("Players you send (names or ids)."),
 				get: z.array(z.string()).min(1).max(8).describe("Players you receive (names or ids)."),
@@ -559,7 +570,7 @@ export function createServer(env: Env): McpServer {
 				const v = await valuations(lc, [...give, ...get], undefined, false);
 				const g = v.rows.slice(0, give.length);
 				const r = v.rows.slice(give.length);
-				const sum = (rows: typeof v.rows, k: keyof PlayerValuation) => round(rows.reduce((s, x) => s + num(x, k), 0), 1);
+				const sum = (rows: typeof v.rows, k: keyof PlayerValuation | "dynasty_value") => round(rows.reduce((s, x) => s + num(x, k), 0), 1);
 				const giveVor = sum(g, "ros_vor");
 				const getVor = sum(r, "ros_vor");
 				const diff = round(getVor - giveVor, 1);
@@ -593,6 +604,13 @@ export function createServer(env: Env): McpServer {
 
 				const verdict =
 					Math.abs(diff) < 5 ? "roughly even" : diff > 0 ? (diff > 25 ? "clearly favors you" : "favors you") : diff < -25 ? "clearly favors them" : "favors them";
+				// Dynasty: also compare long-term market value, as a share of the bigger side.
+				const giveDyn = sum(g, "dynasty_value");
+				const getDyn = sum(r, "dynasty_value");
+				const dynDiff = round(getDyn - giveDyn, 0);
+				const dynPct = Math.max(giveDyn, getDyn) > 0 ? dynDiff / Math.max(giveDyn, getDyn) : 0;
+				const dynastyVerdict =
+					Math.abs(dynPct) < 0.1 ? "roughly even" : dynPct > 0 ? (dynPct > 0.25 ? "clearly favors you" : "favors you") : dynPct < -0.25 ? "clearly favors them" : "favors them";
 				return ok({
 					from_perspective_of: lc.team(mine.roster_id).owner,
 					...(partner ? { partner: lc.team(partner.roster_id).owner } : {}),
@@ -603,8 +621,9 @@ export function createServer(env: Env): McpServer {
 						give: { ros_pts: sum(g, "ros_pts"), ros_vor: giveVor },
 						get: { ros_pts: sum(r, "ros_pts"), ros_vor: getVor },
 						vor_diff: diff,
+						...(v.dynasty ? { dynasty_value_give: giveDyn, dynasty_value_get: getDyn, dynasty_value_diff: dynDiff } : {}),
 					},
-					verdict,
+					...(v.dynasty ? { verdict: { win_now: verdict, long_term: dynastyVerdict } } : { verdict }),
 					...(pool.size
 						? {
 								lineup_this_week: {
@@ -616,7 +635,10 @@ export function createServer(env: Env): McpServer {
 					...(v.repl ? { replacement_level_week: v.repl.level, league_starters: v.repl.starters } : {}),
 					...(warnings.length ? { warnings } : {}),
 					note:
-						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled.",
+						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled." +
+						(v.dynasty
+							? " dynasty_value = market value from Sleeper dynasty ADP (10000 = 1st overall); it is additive, so it overrates trading one star for several depth pieces. Draft picks are not valued."
+							: ""),
 				});
 			} catch (e) {
 				return fail(e);

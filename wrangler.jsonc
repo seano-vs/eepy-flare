@@ -28,8 +28,8 @@
 
     // "none" = authless (phase 1). "github" = OAuth 2.1 with GitHub login (phase 2); also set the
     // secrets GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and COOKIE_ENCRYPTION_KEY.
-    "AUTH_MODE": "none",
+    "AUTH_MODE": "github",
     // GitHub logins and/or numeric user ids allowed to sign in (phase 2). Empty = nobody.
-    "ALLOWED_GITHUB_USERS": ""
+    "ALLOWED_GITHUB_USERS": "seano-vs,64788907"
   }
 }

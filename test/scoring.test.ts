@@ -111,3 +111,31 @@ describe("projection parsing", () => {
 		expect(parseWeekBulk({ not: "an array" }, DEFAULT_SCORING)).toEqual([]);
 	});
 });
+
+import { adpField, dynastyValue, parseAdp } from "../src/dynasty";
+
+describe("dynasty value", () => {
+	it("maps ADP onto a decaying trade-value curve", () => {
+		expect(dynastyValue(1)).toBe(10000);
+		expect(dynastyValue(12)).toBeGreaterThan(dynastyValue(50));
+		expect(dynastyValue(38)).toBeGreaterThan(4900);
+		expect(dynastyValue(38)).toBeLessThan(5100);
+		expect(dynastyValue(999)).toBe(0);
+		expect(dynastyValue(undefined)).toBe(0);
+	});
+	it("uses superflex ADP for superflex leagues", () => {
+		const league = (roster_positions: string[]) => ({ roster_positions }) as unknown as League;
+		expect(adpField(league(["QB", "SUPER_FLEX"]))).toBe("adp_dynasty_2qb");
+		expect(adpField(league(["QB", "FLEX"]))).toBe("adp_dynasty_ppr");
+	});
+	it("parses ADP defensively and skips unranked players", () => {
+		const data = [
+			{ player_id: "1", stats: { adp_dynasty_2qb: 1.3 } },
+			{ player_id: "2", stats: { adp_dynasty_2qb: 999 } },
+			{ player_id: "3", stats: {} },
+			null,
+		];
+		expect(parseAdp(data, "adp_dynasty_2qb")).toEqual({ "1": 1.3 });
+		expect(parseAdp("nope", "adp_dynasty_2qb")).toEqual({});
+	});
+});

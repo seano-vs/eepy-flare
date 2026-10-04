@@ -24,7 +24,7 @@ come out right without hand-tuned multipliers.
 | `search_players` | Player lookup by name, team or position, showing who rosters each player |
 | `project_player` | One player: this week's projection and key stats, rest-of-season points, VOR and season to date |
 | `compare_players` | 2–8 players side by side, for this week (start/sit) and rest of season |
-| `evaluate_trade` | Rest-of-season points and VOR given versus received, plus the effect on both teams' best lineup this week |
+| `evaluate_trade` | Rest-of-season points and VOR given versus received, plus the effect on both teams' best lineup this week. In dynasty leagues it also gives a long-term verdict |
 
 All output is compact JSON, and player IDs are always resolved to `Name POS TEAM (injury)`.
 Any tool that takes a player accepts a name (`"Josh Allen"`, `"Allen BUF"`, `"St. Brown"`) or a
@@ -69,6 +69,14 @@ claude.ai ──POST /mcp──▶ Worker ──▶ createMcpHandler (stateless,
   non-starter. In a 12-team superflex league about 24 QBs start, so replacement-level QB is roughly
   QB25, and QBs carry their real trade value. Rest-of-season runs from the current week through the
   league's last playoff week.
+- **Dynasty.** When Sleeper reports the league as dynasty (`settings.type = 2`), the valuation tools
+  also return `dynasty_adp` and `dynasty_value`. These come from Sleeper's dynasty ADP: superflex
+  ADP (`adp_dynasty_2qb`) in superflex leagues, otherwise 1QB PPR. The ADP is converted to a
+  trade-chart value, where 10000 is the 1st overall pick and value roughly halves every 37 picks.
+  `evaluate_trade` then gives two verdicts: `win_now` (rest-of-season VOR) and `long_term` (dynasty
+  value). Dynasty value is additive, so it overrates trading one star for several depth pieces, and
+  draft picks aren't valued. The ADP comes from the undocumented season-projections endpoint
+  (about 3 MB), is cached in KV for 12 hours, and the dynasty fields are left out if it fails.
 
 ## Setup
 
@@ -199,12 +207,13 @@ consent and upstream helpers.
    npx wrangler secret put COOKIE_ENCRYPTION_KEY   # e.g. `openssl rand -hex 32`; remembers consent for 30 days
    ```
    For local dev, put the same three names in `.dev.vars`, using the local app's ID and secret.
-3. **Set the vars** in `wrangler.jsonc`:
+3. **Check the vars** in `wrangler.jsonc`. This repo is already set to:
    ```jsonc
    "AUTH_MODE": "github",
-   "ALLOWED_GITHUB_USERS": "your-github-login"   // comma-separated logins and/or numeric user ids
+   "ALLOWED_GITHUB_USERS": "seano-vs,64788907"   // comma-separated logins and/or numeric user ids
    ```
    An empty allowlist lets nobody in. A numeric ID still matches after a username change.
+   For authless local testing, put `AUTH_MODE="none"` in `.dev.vars`.
 4. Run `npm run deploy`. In claude.ai, remove the old connector and add the same `/mcp` URL again.
    claude.ai detects that the server needs auth and opens the login.
 
