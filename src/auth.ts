@@ -95,12 +95,15 @@ async function authRoutes(request: Request, env: AuthEnv, ctx: ExecutionContext,
 }
 
 function githubConfig(env: AuthEnv) {
-	if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+	// Trim: values pasted into the dashboard often pick up a stray space or newline.
+	const clientId = env.GITHUB_CLIENT_ID?.trim();
+	const clientSecret = env.GITHUB_CLIENT_SECRET?.trim();
+	if (!clientId || !clientSecret) {
 		throw new Error("AUTH_MODE=github needs the GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET secrets");
 	}
 	return {
-		clientId: env.GITHUB_CLIENT_ID,
-		clientSecret: env.GITHUB_CLIENT_SECRET,
+		clientId,
+		clientSecret,
 		web: (env.GITHUB_URL || "https://github.com").replace(/\/+$/, ""),
 		api: (env.GITHUB_API_URL || "https://api.github.com").replace(/\/+$/, ""),
 	};
