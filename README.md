@@ -10,19 +10,23 @@ passing TDs, full PPR, and so on). Trade and hold value is measured as **value o
 using a replacement level computed from the league's starting slots. That makes superflex QB value
 come out right without hand-tuned multipliers.
 
+Projections, VOR, trade verdicts and dynasty values are still **Sleeper's estimates, not facts**.
+The server says so to every client and points at the assumptions worth checking. See
+[Projections are estimates](#projections-are-estimates).
+
 ## Tools
 
 | Tool | What it returns |
 | --- | --- |
-| `get_league_settings` | Format, roster slots, playoff/waiver/trade settings and a scoring summary |
+| `get_league_settings` | Format, roster slots, playoff/waiver/trade settings (including trade review days) and a scoring summary |
 | `get_rosters` | Every roster with owner, record, PF/PA, starters by slot, bench, IR and taxi |
 | `get_my_roster` | Your roster with this week's projections, the projection-optimal lineup and suggested start/sit swaps |
-| `get_matchup` | Your matchup (or any team's, or `team: "all"` for the scoreboard) with actual and projected points |
+| `get_matchup` | Your matchup (or any team's, or `team: "all"` for the scoreboard) with actual points and pregame projections |
 | `get_transactions` | Trades, waivers and free-agent moves for a week |
 | `get_traded_picks` | Draft picks that have changed hands |
 | `get_trending_players` | Sleeper-wide trending adds and drops, filtered to players available in your league |
 | `search_players` | Player lookup by name, team or position, showing who rosters each player |
-| `project_player` | One player: this week's projection and key stats, rest-of-season points, VOR and season to date |
+| `project_player` | One player: this week's projection and key stats, rest-of-season points, VOR, season to date, bye and projected-out weeks, and what to verify |
 | `compare_players` | 2–8 players side by side, for this week (start/sit) and rest of season |
 | `evaluate_trade` | Rest-of-season points and VOR given versus received, plus the effect on both teams' best lineup this week. In dynasty leagues it also gives a long-term verdict |
 
@@ -77,6 +81,39 @@ claude.ai ──POST /mcp──▶ Worker ──▶ createMcpHandler (stateless,
   value). Dynasty value is additive, so it overrates trading one star for several depth pieces, and
   draft picks aren't valued. The ADP comes from the undocumented season-projections endpoint
   (about 3 MB), is cached in KV for 12 hours, and the dynasty fields are left out if it fails.
+
+## Projections are estimates
+
+Sleeper's projections lag the news, and some of them assume changes nobody has announced. In real
+use they have projected a return date for a player with no public timeline, projected a starting
+QB out after his bye with no injury or announced benching, treated the best case of a 6–10 week
+surgery timeline as the plan, and kept projecting a tight end above his replacements after his
+snap share fell from 83% to 53%. A model that repeats those numbers as fact gives bad advice with
+full confidence, so the server is explicit about what to trust:
+
+- **Authoritative:** rosters, lineups, scores, transactions and league settings.
+- **Estimates:** projections, VOR, out and return weeks, injury tags, optimal lineups, trade verdicts
+  and dynasty values.
+
+How that shows up in the tools:
+
+- **Server instructions** tell every client to attribute projections to Sleeper, check current news
+  before recommending a move, and explain any zero, drop or return date it relies on.
+- **`verify`** on each valued player (`project_player`, `compare_players`, `evaluate_trade`) lists
+  the projection assumptions worth checking: weeks projected out with no injury or status listed,
+  a projected return (treat it as the earliest case), a Questionable player projected for zero or an
+  Out player still projected to play, and rest-of-season ppg at least 25% away from actual ppg
+  (after 4+ games). It's omitted when nothing stands out.
+- **`bye_weeks` and `projected_out_weeks`** replace `out_or_bye_weeks`, so an assumed benching no
+  longer looks like a bye. Byes are the weeks Sleeper's per-player projections return as `null`.
+- **`get_matchup`** reports `projected_pregame`. It sums pregame projections, so a player whose game
+  is over still counts at his projection rather than his actual points, and the total isn't a live
+  score.
+- **`injury_tags_as_of`** shows when the players cache, and so every injury tag, was last refreshed.
+  The cron runs once a day, so Friday's injury report can be missing until the next morning.
+- **`trade_review_days`** in `get_league_settings` says how long an accepted trade waits before it
+  processes, when Sleeper reports it. It's read defensively, because the docs don't list the
+  league settings keys.
 
 ## Setup
 
@@ -244,7 +281,7 @@ serve `/mcp` from a custom domain, add it to `ALLOWED_HOSTNAMES`.
 
 ```sh
 npm run typecheck
-npm test                 # vitest: scoring, replacement level, lineup optimizer, name resolution, allowlist
+npm test                 # vitest: scoring, replacement level, lineup optimizer, name resolution, allowlist, verify notes
 ```
 
 | Path | Purpose |
@@ -255,6 +292,7 @@ npm test                 # vitest: scoring, replacement level, lineup optimizer,
 | `src/tools.ts` | MCP server factory and all tool definitions |
 | `src/league.ts` | League context: config, rosters, owners, team lookup |
 | `src/scoring.ts` | League scoring, projections parsing, replacement level, VOR, lineup optimizer |
+| `src/verify.ts` | The `verify` notes: projection assumptions worth checking against current news |
 | `src/players.ts` | KV players cache: load, refresh, search and resolve |
 | `src/compact-players.ts` | Dump compaction, shared with `scripts/seed-players.mjs` |
 | `src/sleeper.ts` | Sleeper API client and types |
