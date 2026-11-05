@@ -234,7 +234,18 @@ export class NflData {
 	}
 
 	async status(): Promise<Row[]> {
-		return this.all("SELECT dataset, season, checked_at, changed_at, rows, note FROM nfl_sync ORDER BY dataset");
+		const rows = await this.all("SELECT dataset, season, checked_at, changed_at, rows, note FROM nfl_sync ORDER BY dataset");
+		const errors = await this.all<{ dataset: string; error: string; failed_at: string; failures: number }>(
+			"SELECT dataset, error, failed_at, failures FROM nfl_sync_errors",
+		).catch(() => []);
+		const byDataset = new Map(errors.map((e) => [e.dataset, e]));
+		const out = rows.map((r) => {
+			const e = byDataset.get(String(r.dataset));
+			return e ? { ...r, last_error: e.error, failed_at: e.failed_at, consecutive_failures: e.failures } : r;
+		});
+		// A dataset that has never synced successfully has no nfl_sync row; still report its error.
+		for (const e of errors) if (!rows.some((r) => r.dataset === e.dataset)) out.push({ dataset: e.dataset, last_error: e.error, failed_at: e.failed_at, consecutive_failures: e.failures });
+		return out;
 	}
 }
 

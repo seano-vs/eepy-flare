@@ -36,6 +36,8 @@ function schemaStatements(): string[] {
 		"CREATE TABLE IF NOT EXISTS nfl_meta (key TEXT PRIMARY KEY, value TEXT)",
 		"CREATE TABLE IF NOT EXISTS nfl_sync (key TEXT PRIMARY KEY, dataset TEXT, season TEXT, etag TEXT, last_modified TEXT, checked_at TEXT, changed_at TEXT, rows INTEGER, note TEXT)",
 		"CREATE TABLE IF NOT EXISTS nfl_chunk (dataset TEXT, chunk TEXT, hash TEXT, PRIMARY KEY (dataset, chunk))",
+		// Last failure per dataset, cleared by the next successful sync; surfaced by get_nfl_data_status.
+		"CREATE TABLE IF NOT EXISTS nfl_sync_errors (dataset TEXT PRIMARY KEY, error TEXT, failed_at TEXT, failures INTEGER)",
 	];
 	for (const d of DATASETS) {
 		out.push(
@@ -323,8 +325,18 @@ export async function syncAll(db: D1Database, season: string, opts: { force?: bo
 		if (opts.only && !opts.only.includes(d.id)) continue;
 		try {
 			results.push(await syncDataset(db, d, season, opts.force));
+			await db.prepare("DELETE FROM nfl_sync_errors WHERE dataset = ?").bind(d.id).run();
 		} catch (e) {
-			results.push({ dataset: d.id, status: "error", error: e instanceof Error ? e.message : String(e) });
+			const error = (e instanceof Error ? e.message : String(e)).slice(0, 500);
+			results.push({ dataset: d.id, status: "error", error });
+			await db
+				.prepare(
+					`INSERT INTO nfl_sync_errors (dataset, error, failed_at, failures) VALUES (?, ?, ?, 1)
+					 ON CONFLICT(dataset) DO UPDATE SET error = excluded.error, failed_at = excluded.failed_at, failures = nfl_sync_errors.failures + 1`,
+				)
+				.bind(d.id, error, new Date().toISOString())
+				.run()
+				.catch(() => {});
 		}
 	}
 	return results;

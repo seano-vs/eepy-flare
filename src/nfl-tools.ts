@@ -416,7 +416,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		"get_nfl_data_status",
 		{
 			title: "NFL data freshness",
-			description: "When each nflverse dataset mirrored by this server was last checked and last changed, and the latest week with stats.",
+			description: "When each nflverse dataset mirrored by this server was last checked and last changed, any sync errors, and the latest week with stats.",
 			inputSchema: z.object({}),
 			annotations: READ_ONLY,
 		},
@@ -424,7 +424,13 @@ export function registerNflTools(server: McpServer, env: Env): void {
 			try {
 				const { nfl } = await load();
 				const [status, latest] = await Promise.all([nfl.status(), nfl.latestWeek()]);
-				return ok({ latest_stats_week: latest, datasets: status, refresh: "hourly; files are only downloaded when they change upstream" });
+				const failing = status.filter((r) => r.last_error).map((r) => r.dataset);
+				return ok({
+					latest_stats_week: latest,
+					...(failing.length ? { failing } : { healthy: true }),
+					datasets: status,
+					refresh: "hourly; files are only downloaded when they change upstream. A failing dataset keeps its last good data.",
+				});
 			} catch (e) {
 				return fail(e);
 			}
