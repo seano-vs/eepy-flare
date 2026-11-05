@@ -22,7 +22,29 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.0.0";
+export const SERVER_VERSION = "1.1.0";
+
+/**
+ * Server instructions sent to every MCP client. The second half matters as much
+ * as the first: projections and values are Sleeper's estimates, and models
+ * otherwise tend to repeat them as fact.
+ */
+export const INSTRUCTIONS =
+	"Read-only tools for one Sleeper fantasy football league (call get_league_settings for its format and scoring). " +
+	"Players can be referenced by name (optionally with team/position, e.g. 'Josh Allen BUF') or Sleeper id. " +
+	"'me' / omitted team means the configured user's roster. Projections are Sleeper's, re-scored with this league's scoring; " +
+	"VOR is value over a replacement-level starter given the league's lineup slots.\n\n" +
+	"What to trust: rosters, lineups, scores, transactions and league settings are authoritative. " +
+	"Projections, VOR, projected out and return weeks, injury tags, optimal lineups, trade verdicts and dynasty values are " +
+	"Sleeper's estimates, not facts. They lag news, and some assume changes nobody has announced (a benching, a return date). " +
+	"Never present them as fact; attribute them (\"Sleeper projects...\"). Before recommending a start/sit, add/drop, bid or trade, " +
+	"check current, dated news for each player it depends on: injury and practice reports, suspensions, depth chart, recent snap " +
+	"and target share, QB changes. Explain any zero, drop or return date you rely on. Each player's `verify` list names the " +
+	"projection assumptions to check first. A gap of a point or two between players is noise; decide close calls on role, health " +
+	"and matchup. Injury tags come from a once-a-day players cache (see injury_tags_as_of), so they can trail the latest reports.";
+
+const PREGAME_NOTE =
+	"proj and projected_pregame are pregame projections. Once a player's game is over, count his pts instead of his proj; projected_pregame still uses the proj.";
 
 const weekArg = z
 	.number()
@@ -35,13 +57,7 @@ const weekArg = z
 export function createServer(env: Env): McpServer {
 	const server = new McpServer(
 		{ name: SERVER_NAME, version: SERVER_VERSION },
-		{
-			instructions:
-				"Read-only tools for one Sleeper fantasy football league (call get_league_settings for its format and scoring). " +
-				"Players can be referenced by name (optionally with team/position, e.g. 'Josh Allen BUF') or Sleeper id. " +
-				"'me' / omitted team means the configured user's roster. Projections are Sleeper's, re-scored with this league's scoring; " +
-				"VOR is value over a replacement-level starter given the league's lineup slots.",
-		},
+		{ instructions: INSTRUCTIONS },
 	);
 
 	const ctx = () => LeagueContext.load(env);
@@ -62,7 +78,9 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "League settings",
 			description:
-				"League name, season, status, roster slots, playoff/waiver/trade settings and a summary of the scoring rules that matter for skill players.",
+				"League name, season, status, roster slots, playoff/waiver/trade settings and a summary of the scoring rules that matter for skill players. " +
+				"trade_review_days is how long an accepted trade waits before it processes (null when Sleeper doesn't report it); the commissioner can process a trade early. " +
+				"Check it before saying a trade will help this week.",
 			inputSchema: z.object({}),
 			annotations: READ_ONLY,
 		},
@@ -90,6 +108,8 @@ export function createServer(env: Env): McpServer {
 					},
 					waivers: waiverType,
 					trade_deadline_week: s.trade_deadline ?? null,
+					// Read defensively: Sleeper's docs don't list the league settings keys.
+					trade_review_days: s.trade_review_days ?? null,
 					players_cache_updated: lc.players.updated,
 				});
 			} catch (e) {
@@ -104,7 +124,8 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "All rosters",
 			description:
-				"Every team's roster with owner, record, points for/against, starters by slot, bench, IR and taxi. Players shown as 'Name POS TEAM (injury)'.",
+				"Every team's roster with owner, record, points for/against, starters by slot, bench, IR and taxi. Players shown as 'Name POS TEAM (injury)'. " +
+				"Injury tags come from the once-a-day players cache (players_cache_updated in get_league_settings).",
 			inputSchema: z.object({}),
 			annotations: READ_ONLY,
 		},
@@ -133,7 +154,8 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "My roster",
 			description:
-				"The configured user's roster: starters by slot and bench with this week's league-scored projections, FantasyPros weekly rank, official injury/practice report, team implied total and recent usage (snap %, targets, red-zone looks, expected points), plus the projection-optimal lineup and any suggested swaps.",
+				"The configured user's roster: starters by slot and bench with this week's league-scored projections, FantasyPros weekly rank, official injury/practice report, team implied total and recent usage (snap %, targets, red-zone looks, expected points), plus the projection-optimal lineup and any suggested swaps. " +
+				"Projections and the optimal lineup are Sleeper's pregame estimates: check injury reports, inactives and role news before acting on a swap.",
 			inputSchema: z.object({ week: weekArg }),
 			annotations: READ_ONLY,
 		},
@@ -185,6 +207,7 @@ export function createServer(env: Env): McpServer {
 					week: w,
 					starters,
 					bench,
+					injury_tags_as_of: lc.players.updated,
 				};
 				if (r.reserve?.length) out.ir = r.reserve.map((id) => fmt(lc.ref(id)));
 				if (r.taxi?.length) out.taxi = r.taxi.map((id) => fmt(lc.ref(id)));
@@ -222,7 +245,8 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Matchup",
 			description:
-				"Head-to-head matchup for a team and week: both lineups with actual points and league-scored projections. team='all' returns the whole week's scoreboard.",
+				"Head-to-head matchup for a team and week: both lineups with actual points and pregame league-scored projections. team='all' returns the whole week's scoreboard. " +
+				"Projections are not replaced by actual points when a game ends, so projected_pregame is not a live total: for players whose games are over, use pts.",
 			inputSchema: z.object({
 				week: weekArg,
 				team: z
@@ -253,7 +277,8 @@ export function createServer(env: Env): McpServer {
 						owner: info.owner,
 						...(info.team_name ? { team_name: info.team_name } : {}),
 						points: round(m.custom_points ?? m.points ?? 0, 2),
-						...(projected !== undefined ? { projected } : {}),
+						// Pregame: a finished player still counts at his projection here, not his pts.
+						...(projected !== undefined ? { projected_pregame: projected } : {}),
 					};
 					if (!detail) return base;
 					const pp = m.players_points ?? {};
@@ -285,6 +310,7 @@ export function createServer(env: Env): McpServer {
 						matchups: [...byId.entries()]
 							.sort((a, b) => a[0] - b[0])
 							.map(([id, ms]) => ({ matchup_id: id, teams: ms.map((m) => side(m, false)) })),
+						...(pool.size ? { note: PREGAME_NOTE } : {}),
 					});
 				}
 
@@ -297,6 +323,8 @@ export function createServer(env: Env): McpServer {
 					status: w < lc.week ? "final" : w === lc.week ? "current" : "upcoming",
 					team: side(mine, true),
 					opponent: opp ? side(opp, true) : null,
+					injury_tags_as_of: lc.players.updated,
+					...(pool.size ? { note: PREGAME_NOTE } : {}),
 				});
 			} catch (e) {
 				return fail(e);
@@ -490,6 +518,8 @@ export function createServer(env: Env): McpServer {
 					throughWeek: Math.max(w, through),
 					replacement: repl,
 					includeWeeks,
+					injury: p.injury,
+					status: p.status,
 				}),
 			),
 		);
@@ -501,6 +531,7 @@ export function createServer(env: Env): McpServer {
 				id: p.id,
 				league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
 				...(p.age ? { age: p.age } : {}),
+				...(p.status ? { status: p.status } : {}),
 				...(ranks.has(p.id) ? { week_pos_rank: ranks.get(p.id) } : {}),
 				...(vals[i] ?? { projection: "unavailable" }),
 				...(hasAdp ? { dynasty_adp: adp[p.id] ?? null, dynasty_value: dynastyValue(adp[p.id]) } : {}),
@@ -518,7 +549,9 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Project player",
 			description:
-				"League-scored projection for one player: this week's points and key stats, rest-of-season total and per-game, value over replacement (superflex-aware), FantasyPros consensus ranks, recent usage and the official injury report.",
+				"League-scored projection for one player: this week's points and key stats, rest-of-season total and per-game, value over replacement (superflex-aware), " +
+				"bye weeks, weeks Sleeper projects him out, a verify list of assumptions to check, FantasyPros consensus ranks, recent usage and the official injury report. These are Sleeper's estimates, not facts: " +
+				"confirm status and role with current news before recommending anything, and explain any zero, drop or return date you rely on.",
 			inputSchema: z.object({
 				player: z.string().describe("Name (e.g. 'Josh Allen' or 'Allen BUF') or Sleeper player id."),
 				week: weekArg,
@@ -535,6 +568,7 @@ export function createServer(env: Env): McpServer {
 					through_week: v.through_week,
 					...v.rows[0],
 					...(v.repl ? { replacement_level_week: v.repl.level } : { note: "Replacement level unavailable; VOR equals raw points." }),
+					injury_tags_as_of: lc.players.updated,
 				});
 			} catch (e) {
 				return fail(e);
@@ -547,7 +581,8 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Compare players",
 			description:
-				"Compare 2-8 players under this league's scoring: this week's projection (start/sit), rest-of-season points and value over replacement, and in dynasty leagues long-term value from Sleeper dynasty ADP.",
+				"Compare 2-8 players under this league's scoring: this week's projection (start/sit), rest-of-season points and value over replacement, and in dynasty leagues long-term value from Sleeper dynasty ADP. " +
+				"These are Sleeper's estimates: when players are within a couple of points, decide on role, health and matchup rather than the gap, and check each player's verify list.",
 			inputSchema: z.object({
 				players: z.array(z.string()).min(2).max(8).describe("Names or Sleeper ids."),
 				week: weekArg,
@@ -570,6 +605,7 @@ export function createServer(env: Env): McpServer {
 					...(v.dynasty
 						? { best_dynasty: [...v.rows].sort((a, b) => num(b, "dynasty_value") - num(a, "dynasty_value"))[0]?.player }
 						: {}),
+					injury_tags_as_of: lc.players.updated,
 				});
 			} catch (e) {
 				return fail(e);
@@ -582,7 +618,9 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Evaluate trade",
 			description:
-				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (Sleeper dynasty ADP, plus draft picks) and gives separate win-now and long-term verdicts.",
+				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (Sleeper dynasty ADP, plus draft picks) and gives separate win-now and long-term verdicts. " +
+				"The verdicts inherit Sleeper's projections and ADP, which lag injuries, suspensions and role changes: before pitching a trade, check each player's verify list and current news, " +
+				"and check trade_review_days (get_league_settings) before saying it helps this week.",
 			inputSchema: z.object({
 				give: z.array(z.string()).max(8).optional().describe("Players you send (names or ids)."),
 				get: z.array(z.string()).max(8).optional().describe("Players you receive (names or ids)."),
@@ -678,8 +716,10 @@ export function createServer(env: Env): McpServer {
 						: {}),
 					...(v.repl ? { replacement_level_week: v.repl.level, league_starters: v.repl.starters } : {}),
 					...(warnings.length ? { warnings } : {}),
+					injury_tags_as_of: lc.players.updated,
 					note:
-						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled." +
+						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled: " +
+						"the verdicts are only as good as Sleeper's projections, so check each player's verify list and current news before acting." +
 						(v.dynasty
 							? " dynasty_value = market value from Sleeper dynasty ADP (10000 = 1st overall); it is additive, so it overrates trading one star for several depth pieces. " +
 								"A pick is valued as this year's rookie drafted at that overall slot (current dynasty value), minus 10% per extra year out; slot defaults to the original owner's current standing."

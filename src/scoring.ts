@@ -8,6 +8,7 @@
 // starting slots, so a superflex league naturally values QBs much higher.
 
 import { sleeper, type League } from "./sleeper";
+import { verifyNotes } from "./verify";
 
 export const PROJECTED_POSITIONS = ["QB", "RB", "WR", "TE"] as const;
 export type SkillPos = (typeof PROJECTED_POSITIONS)[number];
@@ -252,13 +253,61 @@ export interface PlayerValuation {
 	ros_ppg: number;
 	/** Value over replacement across the rest of the season. */
 	ros_vor: number;
-	/** Weeks in that range with no projected game (bye, or projected out). */
-	out_or_bye_weeks: number[];
+	/** Weeks in that range when the player's team is on bye. */
+	bye_weeks: number[];
+	/**
+	 * Non-bye weeks in that range with no projected game: an injury, a suspension,
+	 * or an assumption Sleeper doesn't explain (e.g. an expected benching).
+	 */
+	projected_out_weeks: number[];
 	/** Actual points so far this season under league scoring. */
 	season_pts?: number;
 	season_games?: number;
 	weeks?: { week: number; opp: string | null; pts: number }[];
 	key_stats?: Record<string, number>;
+	/** Projection assumptions to check against current news before relying on them. */
+	verify?: string[];
+}
+
+export interface WeekSummary {
+	perWeek: { week: number; opp: string | null; pts: number }[];
+	byeWeeks: number[];
+	outWeeks: number[];
+	ros: number;
+	vor: number;
+}
+
+/**
+ * Walk a player's weekly projections from `fromWeek` through `throughWeek`.
+ * Sleeper returns null for bye weeks; any other week without a projected game
+ * counts as projected out. Weeks missing from the response are skipped.
+ * Pure; exported for tests.
+ */
+export function summarizeWeeks(
+	weeks: Map<number, WeekProjection | null>,
+	fromWeek: number,
+	throughWeek: number,
+	scoring: Record<string, number>,
+	replacement: number,
+): WeekSummary {
+	const s: WeekSummary = { perWeek: [], byeWeeks: [], outWeeks: [], ros: 0, vor: 0 };
+	for (let w = fromWeek; w <= throughWeek; w++) {
+		if (!weeks.has(w)) continue;
+		const wp = weeks.get(w);
+		if (wp === null) {
+			s.byeWeeks.push(w);
+			continue;
+		}
+		if (!wp || !plays(wp.stats)) {
+			s.outWeeks.push(w);
+			continue;
+		}
+		const pts = scoreStats(wp.stats, scoring);
+		s.perWeek.push({ week: w, opp: wp.opp, pts });
+		s.ros += pts;
+		s.vor += pts - replacement;
+	}
+	return s;
 }
 
 const KEY_STATS = [
@@ -287,6 +336,9 @@ export async function valuePlayer(opts: {
 	throughWeek: number;
 	replacement: Replacement | null;
 	includeWeeks?: boolean;
+	/** Sleeper injury_status and non-Active roster status, used for the verify notes. */
+	injury?: string;
+	status?: string;
 }): Promise<PlayerValuation | null> {
 	const [projRaw, statsRaw] = await Promise.all([
 		sleeper.playerProjections(opts.playerId, opts.season, opts.seasonType).catch(() => null),
@@ -297,32 +349,18 @@ export async function valuePlayer(opts: {
 
 	const scoring = opts.league.scoring_settings;
 	const repl = opts.replacement?.level[opts.pos as SkillPos] ?? 0;
-	const off: number[] = [];
-	const perWeek: { week: number; opp: string | null; pts: number }[] = [];
-	let ros = 0;
-	let vor = 0;
-	for (let w = opts.week; w <= opts.throughWeek; w++) {
-		if (!weeks.has(w)) continue;
-		const wp = weeks.get(w);
-		if (!wp || !plays(wp.stats)) {
-			off.push(w);
-			continue;
-		}
-		const pts = scoreStats(wp.stats, scoring);
-		perWeek.push({ week: w, opp: wp.opp, pts });
-		ros += pts;
-		vor += pts - repl;
-	}
+	const sum = summarizeWeeks(weeks, opts.week, opts.throughWeek, scoring, repl);
 	const current = weeks.get(opts.week) ?? null;
 	const playsNow = current && plays(current.stats);
 	const v: PlayerValuation = {
 		week_pts: playsNow ? scoreStats(current.stats, scoring) : null,
 		week_opp: current?.opp ?? null,
-		ros_pts: round(ros, 1),
-		ros_games: perWeek.length,
-		ros_ppg: perWeek.length ? round(ros / perWeek.length, 1) : 0,
-		ros_vor: round(vor, 1),
-		out_or_bye_weeks: off,
+		ros_pts: round(sum.ros, 1),
+		ros_games: sum.perWeek.length,
+		ros_ppg: sum.perWeek.length ? round(sum.ros / sum.perWeek.length, 1) : 0,
+		ros_vor: round(sum.vor, 1),
+		bye_weeks: sum.byeWeeks,
+		projected_out_weeks: sum.outWeeks,
 	};
 
 	// Season to date, from actual stats (also undocumented; skipped if missing).
@@ -338,7 +376,7 @@ export async function valuePlayer(opts: {
 		v.season_games = seasonGames;
 	}
 
-	if (opts.includeWeeks) v.weeks = perWeek;
+	if (opts.includeWeeks) v.weeks = sum.perWeek;
 	if (playsNow) {
 		const ks: Record<string, number> = {};
 		for (const k of KEY_STATS) {
@@ -347,6 +385,19 @@ export async function valuePlayer(opts: {
 		}
 		v.key_stats = ks;
 	}
+
+	const verify = verifyNotes({
+		week: opts.week,
+		playedWeeks: sum.perWeek.map((x) => x.week),
+		byeWeeks: sum.byeWeeks,
+		outWeeks: sum.outWeeks,
+		injury: opts.injury,
+		status: opts.status,
+		rosPpg: v.ros_ppg,
+		seasonPts: v.season_pts,
+		seasonGames: v.season_games,
+	});
+	if (verify.length) v.verify = verify;
 	return v;
 }
 
