@@ -14,6 +14,7 @@ import {
 } from "./scoring";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { READ_ONLY, fail, fmt, ok } from "./result";
+import { impliedTotals, playerContext, type PlayerContext } from "./nflverse/context";
 import { registerNflTools } from "./nfl-tools";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
 
@@ -131,7 +132,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "My roster",
 			description:
-				"The configured user's roster: starters by slot and bench with this week's league-scored projections, plus the projection-optimal lineup and any suggested swaps.",
+				"The configured user's roster: starters by slot and bench with this week's league-scored projections, FantasyPros weekly rank, official injury/practice report, team implied total and recent usage (snap %, targets, red-zone looks, expected points), plus the projection-optimal lineup and any suggested swaps.",
 			inputSchema: z.object({ week: weekArg }),
 			annotations: READ_ONLY,
 		},
@@ -140,20 +141,38 @@ export function createServer(env: Env): McpServer {
 				const lc = await ctx();
 				const r = lc.myRoster();
 				const w = week ?? lc.week;
-				const pool = poolMap(await weekPool(env.PLAYERS, lc.league, lc.season, w, lc.seasonType));
+				const [poolArr, nflCtx, implied] = await Promise.all([
+					weekPool(env.PLAYERS, lc.league, lc.season, w, lc.seasonType),
+					playerContext(lc, r.players ?? [], { dynasty: isDynasty(lc.league) }),
+					impliedTotals(lc, w),
+				]);
+				const pool = poolMap(poolArr);
 				const proj = (id: string) => pool.get(id)?.pts ?? (pool.size ? 0 : null);
+				// nflverse context per player: weekly consensus rank, injury report, team implied total, recent usage.
+				const extra = (id: string) => {
+					const c = nflCtx.get(id);
+					const team = lc.players.get(id)?.team;
+					return {
+						...(c?.ecr?.week ? { ecr: c.ecr.week } : {}),
+						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
+						...(c?.injury_report ? { injury_report: c.injury_report } : {}),
+						...(team && implied.has(team) ? { implied: implied.get(team) } : {}),
+						...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
+					};
+				};
 
 				const slots = lc.league.roster_positions.filter((s) => s !== "BN");
 				const starters = (r.starters ?? []).map((id, i) => ({
 					slot: slots[i] ?? "?",
 					player: fmt(lc.ref(id)),
 					proj: id === "0" ? null : proj(id),
+					...(id === "0" ? {} : extra(id)),
 				}));
 				const starterSet = new Set(r.starters ?? []);
 				const reserve = new Set([...(r.reserve ?? []), ...(r.taxi ?? [])]);
 				const bench = (r.players ?? [])
 					.filter((id) => !starterSet.has(id) && !reserve.has(id))
-					.map((id) => ({ player: fmt(lc.ref(id)), proj: proj(id) }))
+					.map((id) => ({ player: fmt(lc.ref(id)), proj: proj(id), ...extra(id) }))
 					.sort((a, b) => (b.proj ?? 0) - (a.proj ?? 0));
 
 				const out: Record<string, unknown> = {
@@ -164,6 +183,7 @@ export function createServer(env: Env): McpServer {
 				};
 				if (r.reserve?.length) out.ir = r.reserve.map((id) => fmt(lc.ref(id)));
 				if (r.taxi?.length) out.taxi = r.taxi.map((id) => fmt(lc.ref(id)));
+				if (nflCtx.size) out.legend = CONTEXT_LEGEND;
 
 				if (pool.size) {
 					const active = (r.players ?? []).filter((id) => !reserve.has(id));
@@ -345,7 +365,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Trending players",
 			description:
-				"Players trending on Sleeper waivers league-wide (most added and/or dropped), filtered to players available in this league by default, with this week's league-scored projection.",
+				"Players trending on Sleeper waivers league-wide (most added and/or dropped), filtered to players available in this league by default, with this week's league-scored projection, recent usage (snap %, targets, red-zone looks, expected points) and FantasyPros rest-of-season rank.",
 			inputSchema: z.object({
 				kind: z.enum(["add", "drop", "both"]).optional().describe("Default 'add'."),
 				lookback_hours: z.number().int().min(1).max(168).optional().describe("Default 24."),
@@ -366,17 +386,25 @@ export function createServer(env: Env): McpServer {
 				for (const k of kinds) {
 					// Over-fetch because rostered players get filtered out.
 					const raw = (await sleeper.trending(k, lookback_hours ?? 24, 100)) ?? [];
-					out[k === "add" ? "adds" : "drops"] = raw
+					const picked = raw
 						.filter((t) => !onlyAvail || !owned.has(t.player_id))
 						.map((t) => ({ t, p: lc.players.get(t.player_id) }))
 						.filter(({ p }) => p && (!position || p.pos === position) && ["QB", "RB", "WR", "TE"].includes(p.pos))
-						.slice(0, limit ?? 25)
-						.map(({ t, p }) => ({
+						.slice(0, limit ?? 25);
+					// Recent usage separates a real role change from a one-week blip.
+					const nflCtx = await playerContext(lc, picked.map(({ t }) => t.player_id));
+					out[k === "add" ? "adds" : "drops"] = picked.map(({ t, p }) => {
+						const c = nflCtx.get(t.player_id);
+						return {
 							player: fmt(p!),
 							count: t.count,
 							...(pool.size ? { proj_week: pool.get(t.player_id)?.pts ?? 0 } : {}),
+							...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
+							...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 							...(!onlyAvail && owned.has(t.player_id) ? { rostered_by: lc.team(owned.get(t.player_id)!).owner } : {}),
-						}));
+						};
+					});
+					if (nflCtx.size) out.legend = CONTEXT_LEGEND + " ros_rank = FantasyPros rest-of-season positional rank.";
 				}
 				return ok(out);
 			} catch (e) {
@@ -444,6 +472,7 @@ export function createServer(env: Env): McpServer {
 		const owned = lc.ownership();
 		const ranks = positionRanks(pool);
 		const players = queries.map((q) => lc.players.resolve(q));
+		const nflCtxP = playerContext(lc, players.map((p) => p.id), { dynasty });
 		const vals = await Promise.all(
 			players.map((p) =>
 				valuePlayer({
@@ -459,15 +488,23 @@ export function createServer(env: Env): McpServer {
 				}),
 			),
 		);
-		const rows = players.map((p, i) => ({
-			player: fmt(p),
-			id: p.id,
-			league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
-			...(p.age ? { age: p.age } : {}),
-			...(ranks.has(p.id) ? { week_pos_rank: ranks.get(p.id) } : {}),
-			...(vals[i] ?? { projection: "unavailable" }),
-			...(hasAdp ? { dynasty_adp: adp[p.id] ?? null, dynasty_value: dynastyValue(adp[p.id]) } : {}),
-		}));
+		const nflCtx = await nflCtxP;
+		const rows = players.map((p, i) => {
+			const c = nflCtx.get(p.id);
+			return {
+				player: fmt(p),
+				id: p.id,
+				league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
+				...(p.age ? { age: p.age } : {}),
+				...(ranks.has(p.id) ? { week_pos_rank: ranks.get(p.id) } : {}),
+				...(vals[i] ?? { projection: "unavailable" }),
+				...(hasAdp ? { dynasty_adp: adp[p.id] ?? null, dynasty_value: dynastyValue(adp[p.id]) } : {}),
+				// FantasyPros consensus (a second opinion next to Sleeper's projections/ADP) and recent nflverse usage.
+				...(c?.ecr ? { consensus: c.ecr } : {}),
+				...(c?.recent ? { recent: c.recent } : {}),
+				...(c?.injury_report ? { injury_report: c.injury_report } : {}),
+			};
+		});
 		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp };
 	}
 
@@ -476,7 +513,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Project player",
 			description:
-				"League-scored projection for one player: this week's points and key stats, rest-of-season total and per-game, and value over replacement (superflex-aware).",
+				"League-scored projection for one player: this week's points and key stats, rest-of-season total and per-game, value over replacement (superflex-aware), FantasyPros consensus ranks, recent usage and the official injury report.",
 			inputSchema: z.object({
 				player: z.string().describe("Name (e.g. 'Josh Allen' or 'Allen BUF') or Sleeper player id."),
 				week: weekArg,
@@ -717,4 +754,15 @@ export function summarizeScoring(s: Record<string, number>, rosterPositions: str
 	}
 	return out;
 }
+
+/** Recent-usage block for list views: drop the window label (shown once in the legend). */
+function compactRecent(r: NonNullable<PlayerContext["recent"]>) {
+	const { weeks: _w, ...rest } = r;
+	return rest;
+}
+
+const CONTEXT_LEGEND =
+	"ecr = FantasyPros consensus positional rank this week (omitted until this week's rankings are published); ros_rank = rest-of-season rank. implied = team's Vegas implied points. " +
+	"recent = per-game over the last 3 weeks with stats: snap %, targets and target share, carries, rz_opps (red-zone targets + carries), " +
+	"pts under league scoring and xfp (expected points for that usage). injury_report = official report: status (injury), practice.";
 

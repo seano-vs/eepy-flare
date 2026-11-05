@@ -100,14 +100,32 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 | `nfl_injuries` | `injuries_{season}`: game status and practice participation | daily 07:00 UTC |
 | `nfl_opportunity` | [ffopportunity](https://github.com/ffverse/ffopportunity) `ep_weekly_{season}`: expected stats | nightly |
 | `nfl_games` | `schedules/games`: kickoff, scores, spread, total, moneylines | every 5 min |
-| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ids | daily |
+| `nfl_pbp_week` | derived from `play_by_play_{season}.parquet`: red-zone targets/carries and team shares, end-zone and deep (20+ air yards) targets, carries inside the 10 and 5 | nightly after game days |
+| `nfl_ngs_receiving` / `_rushing` / `_passing` | NFL Next Gen Stats, weekly: separation, cushion, aDOT, YAC over expected; rush yards over expected, 8-man boxes; CPOE, time to throw, aggressiveness | nightly |
+| `nfl_ecr` | FantasyPros consensus rankings via DynastyProcess `db_fpecr_latest`: weekly superflex and positional, rest-of-season positional, dynasty superflex | weekly |
+| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ↔ FantasyPros ids | daily |
 
 - **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
   unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
   column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
   changed are rewritten. Stat corrections (by Wednesday night) touch a week or two, so a normal
   update writes a few hundred rows, well inside D1's free 100,000 writes a day. The first sync
-  writes about 12,000 rows.
+  writes about 17,000 rows.
+- **Play-by-play.** The season's play-by-play is about 9 MB of Snappy-compressed Parquet with 372
+  columns. [`hyparquet`](https://github.com/hyparam/hyparquet) (pure JS) reads just the 10 columns
+  needed, and the plays are aggregated into one row per player-week before anything is stored. Raw
+  plays aren't kept: the tools only need the aggregates, and a season of plays would be 50,000 rows
+  of mostly unused columns. For ad-hoc SQL over full play-by-play history, the Parquet files could
+  be registered as Iceberg tables in R2 and queried with Basin SQL, but that's analytics, not
+  something a tool call should wait seconds for.
+- **Existing tools use this data.** `get_my_roster`, `project_player`, `compare_players`,
+  `evaluate_trade` and `get_trending_players` add FantasyPros consensus ranks, recent usage (snap %,
+  targets, red-zone looks, points and expected points over the last 3 weeks) and the official injury
+  report. `get_my_roster` also shows each player's team implied total. If D1 isn't configured or
+  hasn't synced, these fields are simply left out.
+- **Rankings freshness.** FantasyPros weekly ranks are hidden once a new NFL week has started
+  (Tuesday) until the next scrape. Otherwise last week's ranks would read as this week's.
+  Rest-of-season and dynasty ranks are always shown, with their date.
 - **Schema.** Tables are created by the first sync, so no migrations need to run in the build.
   Changing a table definition bumps `SCHEMA_VERSION` in `src/nflverse/sync.ts`, and the next sync
   drops and rebuilds everything from upstream.
@@ -119,7 +137,8 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 - **IDs.** nflverse uses GSIS and PFR ids. The DynastyProcess map links about 99% of fantasy-relevant
   players to Sleeper ids. Unmapped players still appear in rankings under their nflverse name.
 - **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
-  nflverse (nflverse.com), ffverse, and DynastyProcess.
+  nflverse (nflverse.com), ffverse, and DynastyProcess. Next Gen Stats come from the NFL and
+  rankings from FantasyPros, both as republished by those projects.
 
 ## Setup
 
@@ -262,14 +281,32 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 | `nfl_injuries` | `injuries_{season}`: game status and practice participation | daily 07:00 UTC |
 | `nfl_opportunity` | [ffopportunity](https://github.com/ffverse/ffopportunity) `ep_weekly_{season}`: expected stats | nightly |
 | `nfl_games` | `schedules/games`: kickoff, scores, spread, total, moneylines | every 5 min |
-| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ids | daily |
+| `nfl_pbp_week` | derived from `play_by_play_{season}.parquet`: red-zone targets/carries and team shares, end-zone and deep (20+ air yards) targets, carries inside the 10 and 5 | nightly after game days |
+| `nfl_ngs_receiving` / `_rushing` / `_passing` | NFL Next Gen Stats, weekly: separation, cushion, aDOT, YAC over expected; rush yards over expected, 8-man boxes; CPOE, time to throw, aggressiveness | nightly |
+| `nfl_ecr` | FantasyPros consensus rankings via DynastyProcess `db_fpecr_latest`: weekly superflex and positional, rest-of-season positional, dynasty superflex | weekly |
+| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ↔ FantasyPros ids | daily |
 
 - **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
   unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
   column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
   changed are rewritten. Stat corrections (by Wednesday night) touch a week or two, so a normal
   update writes a few hundred rows, well inside D1's free 100,000 writes a day. The first sync
-  writes about 12,000 rows.
+  writes about 17,000 rows.
+- **Play-by-play.** The season's play-by-play is about 9 MB of Snappy-compressed Parquet with 372
+  columns. [`hyparquet`](https://github.com/hyparam/hyparquet) (pure JS) reads just the 10 columns
+  needed, and the plays are aggregated into one row per player-week before anything is stored. Raw
+  plays aren't kept: the tools only need the aggregates, and a season of plays would be 50,000 rows
+  of mostly unused columns. For ad-hoc SQL over full play-by-play history, the Parquet files could
+  be registered as Iceberg tables in R2 and queried with Basin SQL, but that's analytics, not
+  something a tool call should wait seconds for.
+- **Existing tools use this data.** `get_my_roster`, `project_player`, `compare_players`,
+  `evaluate_trade` and `get_trending_players` add FantasyPros consensus ranks, recent usage (snap %,
+  targets, red-zone looks, points and expected points over the last 3 weeks) and the official injury
+  report. `get_my_roster` also shows each player's team implied total. If D1 isn't configured or
+  hasn't synced, these fields are simply left out.
+- **Rankings freshness.** FantasyPros weekly ranks are hidden once a new NFL week has started
+  (Tuesday) until the next scrape. Otherwise last week's ranks would read as this week's.
+  Rest-of-season and dynasty ranks are always shown, with their date.
 - **Schema.** Tables are created by the first sync, so no migrations need to run in the build.
   Changing a table definition bumps `SCHEMA_VERSION` in `src/nflverse/sync.ts`, and the next sync
   drops and rebuilds everything from upstream.
@@ -281,7 +318,8 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 - **IDs.** nflverse uses GSIS and PFR ids. The DynastyProcess map links about 99% of fantasy-relevant
   players to Sleeper ids. Unmapped players still appear in rankings under their nflverse name.
 - **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
-  nflverse (nflverse.com), ffverse, and DynastyProcess.
+  nflverse (nflverse.com), ffverse, and DynastyProcess. Next Gen Stats come from the NFL and
+  rankings from FantasyPros, both as republished by those projects.
 
 ## Setup
 
@@ -319,7 +357,8 @@ To test locally, run `npm run dev` with the phase 2 values in `.dev.vars`. In MC
   1000 requests per minute.
 - **CPU.** Tool calls do little work. The heavier steps are parsing the 15 MB players dump in the
   daily cron, the 2 MB weekly projection pool (at most every 6 hours), and parsing an nflverse file
-  when it changes (about 70–80 ms for all of them together; unchanged files cost nothing). On the
+  when it changes. That's about 100 ms for play-by-play and 200 ms if every file changed at once;
+  unchanged files cost nothing. On the
   **Workers Paid** plan both fit comfortably. On the free plan (10 ms CPU), the cron refresh may hit
   the CPU limit. If it does, run `npm run seed-players` from your machine once a day, or whenever
   rosters change a lot. It does the parsing locally and only uploads the compact blob.
@@ -353,4 +392,5 @@ npm test                 # vitest: scoring, replacement level, lineup optimizer,
 | `src/nflverse/sync.ts` | Hourly sync into D1: conditional downloads, per-week hashing, batched writes |
 | `src/nflverse/csv.ts` | CSV parsing, including the column-selective fast path |
 | `src/nflverse/stats.ts` | League-scored actual and expected points, and D1 queries |
+| `src/nflverse/context.ts` | Compact per-player context (usage, rankings, injuries) used by the existing tools |
 | `src/result.ts` | Shared tool-result helpers |

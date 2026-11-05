@@ -5,6 +5,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { LeagueContext } from "./league";
 import { NflData, expectedPoints, leaguePoints, sleeperTeam, unmappedRules } from "./nflverse/stats";
+import { describeInjury } from "./nflverse/context";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { round } from "./scoring";
 
@@ -17,7 +18,7 @@ const num = (r: Row | undefined, k: string): number => {
 const avg = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
 const pct = (x: number) => round(x * 100, 1);
 
-const SORTS = ["xfp", "buy_low", "sell_high", "targets", "target_share", "wopr", "carries", "snap_pct", "air_yards", "points"] as const;
+const SORTS = ["xfp", "buy_low", "sell_high", "targets", "target_share", "wopr", "carries", "snap_pct", "air_yards", "red_zone", "points"] as const;
 
 export function registerNflTools(server: McpServer, env: Env): void {
 	const load = async () => {
@@ -38,8 +39,8 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		{
 			title: "Player usage trends",
 			description:
-				"Week-by-week usage from nflverse for 1-6 players: snap share, targets, target share, air-yards share, WOPR, carries, production, " +
-				"points under this league's scoring, and expected fantasy points (ffopportunity, re-scored for this league). Plus the latest injury/practice report.",
+				"Week-by-week usage from nflverse for 1-6 players: snap share, targets, target share, air-yards share, WOPR, carries, red-zone/goal-line/end-zone/deep usage (play-by-play), production, " +
+				"points under this league's scoring, expected fantasy points (ffopportunity, re-scored for this league), Next Gen Stats (separation, YAC over expected, rush yards over expected, CPOE, time to throw) and the current injury/practice report.",
 			inputSchema: z.object({
 				players: z.array(z.string()).min(1).max(6).describe("Names (e.g. 'Puka Nacua') or Sleeper ids."),
 				weeks: z.number().int().min(1).max(18).optional().describe("How many recent weeks (default 4)."),
@@ -69,13 +70,17 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						out.push({ ...base, note: "No nflverse id mapping for this player." });
 						continue;
 					}
-					const [stats, opp, snaps] = await Promise.all([
+					const ngsTable = p.pos === "QB" ? "nfl_ngs_passing" : p.pos === "RB" ? "nfl_ngs_rushing" : "nfl_ngs_receiving";
+					const [stats, opp, snaps, pbp, ngs] = await Promise.all([
 						nfl.byPlayer("nfl_player_week", "gsis_id", id.gsis_id, from, latest),
 						nfl.byPlayer("nfl_opportunity", "gsis_id", id.gsis_id, from, latest),
 						id.pfr_id ? nfl.byPlayer("nfl_snaps", "pfr_id", id.pfr_id, from, latest) : Promise.resolve([] as Row[]),
+						nfl.byPlayer("nfl_pbp_week", "gsis_id", id.gsis_id, from, latest),
+						nfl.byPlayer(ngsTable, "gsis_id", id.gsis_id, from, latest),
 					]);
 					const oppBy = new Map(opp.map((r) => [r.week as number, r]));
 					const snapBy = new Map(snaps.map((r) => [r.week as number, r]));
+					const pbpBy = new Map(pbp.map((r) => [r.week as number, r]));
 					const isQb = p.pos === "QB";
 					const rows = stats.map((r) => {
 						const w = r.week as number;
@@ -83,6 +88,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						const s = snapBy.get(w);
 						const pts = leaguePoints(r, scoring);
 						const xfp = o ? expectedPoints(o, scoring) : null;
+						const pb = pbpBy.get(w);
 						return {
 							week: w,
 							opp: sleeperTeam(r.opp),
@@ -108,12 +114,14 @@ export function registerNflTools(server: McpServer, env: Env): void {
 										rec_yd: num(r, "receiving_yards"),
 									}),
 							td: num(r, "rushing_tds") + num(r, "receiving_tds"),
+							...(pb ? redZone(pb, p.pos) : {}),
 							pts,
 							...(xfp != null ? { xfp, diff: round(pts - xfp, 1) } : {}),
 						};
 					});
 					const per = (k: string) => round(avg(rows.map((x) => num(x as Row, k))), 1);
 					const inj = injuries.find((i) => i.gsis_id === id.gsis_id);
+					const rzTotals = pbp.length ? redZoneTotals(pbp, p.pos, rows.length) : {};
 					out.push({
 						...base,
 						weeks: rows,
@@ -122,19 +130,12 @@ export function registerNflTools(server: McpServer, env: Env): void {
 							...(snaps.length ? { snap_pct: per("snap_pct") } : {}),
 							...(isQb ? { pass_yd: per("pass_yd"), pass_td: per("pass_td") } : { targets: per("targets"), tgt_share: per("tgt_share"), wopr: round(avg(rows.map((x) => num(x as Row, "wopr"))), 2) }),
 							carries: per("carries"),
+							...rzTotals,
 							pts: per("pts"),
 							...(opp.length ? { xfp: per("xfp"), diff: per("diff") } : {}),
 						},
-						...(inj
-							? {
-									injury_report: {
-										week: inj.week,
-										game_status: inj.report_status ?? null,
-										injury: inj.report_injury ?? inj.practice_injury ?? null,
-										practice: inj.practice_status ?? null,
-									},
-								}
-							: {}),
+						...(ngs.length ? { next_gen: nextGen(ngs, p.pos) } : {}),
+						...(inj ? { injury_report: `${describeInjury(inj) ?? "On report"} (week ${inj.week})` } : {}),
 					});
 				}
 				const gaps = unmappedRules(scoring);
@@ -142,7 +143,9 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					weeks: `${from}-${latest}`,
 					players: out,
 					note:
-						"pts = this league's scoring applied to nflverse box scores. xfp = expected points for the same usage (ffopportunity model), re-scored for this league; diff = pts - xfp (negative = unlucky)." +
+						"pts = this league's scoring applied to nflverse box scores. xfp = expected points for the same usage (ffopportunity model), re-scored for this league; diff = pts - xfp (negative = unlucky). " +
+						"Red zone from play-by-play: rz_tgt/rz_car inside the 20 (with share of team), ez_tgt = targets at or past the goal line, gl_car = carries inside the 5, deep_tgt = 20+ air yards. " +
+						"next_gen = NFL Next Gen Stats averages over the weeks the player qualified." +
 						(gaps.length ? ` Not reproduced: ${gaps.join(", ")}.` : ""),
 				});
 			} catch (e) {
@@ -177,19 +180,20 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				const from = Math.max(1, latest - span + 1);
 				const posFilter = position ? "AND position = ?" : "";
 				const posArgs = position ? [position] : [];
-				const [stats, opps, snaps, maps] = await Promise.all([
+				const [stats, opps, snaps, pbp, maps] = await Promise.all([
 					nfl.weekRange("nfl_player_week", from, latest, posFilter, ...posArgs),
 					nfl.weekRange("nfl_opportunity", from, latest, posFilter, ...posArgs),
 					nfl.weekRange("nfl_snaps", from, latest, posFilter, ...posArgs),
+					nfl.weekRange("nfl_pbp_week", from, latest),
 					nfl.idMaps(),
 				]);
 				const scoring = lc.league.scoring_settings;
-				type Agg = { r: Row; games: number; pts: number; xfp: number; oppGames: number; tgt: number; share: number[]; wopr: number[]; car: number; air: number; snap: number[] };
+				type Agg = { r: Row; games: number; pts: number; xfp: number; oppGames: number; tgt: number; share: number[]; wopr: number[]; car: number; air: number; snap: number[]; rz: number };
 				const agg = new Map<string, Agg>();
 				for (const r of stats) {
 					const g = String(r.gsis_id);
 					let a = agg.get(g);
-					if (!a) agg.set(g, (a = { r, games: 0, pts: 0, xfp: 0, oppGames: 0, tgt: 0, share: [], wopr: [], car: 0, air: 0, snap: [] }));
+					if (!a) agg.set(g, (a = { r, games: 0, pts: 0, xfp: 0, oppGames: 0, tgt: 0, share: [], wopr: [], car: 0, air: 0, snap: [], rz: 0 }));
 					a.games++;
 					a.pts += leaguePoints(r, scoring);
 					a.tgt += num(r, "targets");
@@ -203,6 +207,10 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					if (!a) continue;
 					a.xfp += expectedPoints(o, scoring);
 					a.oppGames++;
+				}
+				for (const p of pbp) {
+					const a = agg.get(String(p.gsis_id));
+					if (a) a.rz += num(p, "rz_targets") + num(p, "rz_carries");
 				}
 				const gsisOfSleeper = maps.bySleeper;
 				const sleeperOfGsis = maps.byGsis;
@@ -231,6 +239,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 							wopr: round(avg(a.wopr), 2),
 							carries: round(a.car / a.games, 1),
 							air_yards: round(a.air / a.games, 1),
+							rz_opps: round(a.rz / a.games, 1),
 							pts: round(ppg, 1),
 							...(xpg != null ? { xfp: round(xpg, 1), diff: round(ppg - xpg, 1) } : {}),
 						};
@@ -248,6 +257,8 @@ export function registerNflTools(server: McpServer, env: Env): void {
 							return num(x, "tgt_share");
 						case "points":
 							return num(x, "pts");
+						case "red_zone":
+							return num(x, "rz_opps");
 						default:
 							return num(x, key);
 					}
@@ -262,7 +273,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					weeks: `${from}-${latest}`,
 					sort: key,
 					players: rows.slice(0, limit ?? 15).map(compact),
-					note: "Per-game averages. pts/xfp use this league's scoring; diff = pts - xfp. buy_low/sell_high only consider players with 6+ xfp per game.",
+					note: "Per-game averages. pts/xfp use this league's scoring; diff = pts - xfp. rz_opps = red-zone targets + carries. buy_low/sell_high only consider players with 6+ xfp per game.",
 				});
 			} catch (e) {
 				return fail(e);
@@ -420,3 +431,60 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		},
 	);
 }
+
+/** Per-week red-zone fields for a player row (position-appropriate, zeros dropped). */
+function redZone(p: Row, pos: string): Row {
+	const out: Row = {};
+	const put = (k: string, v: number) => {
+		if (v) out[k] = v;
+	};
+	if (pos === "QB") {
+		put("rz_att", num(p, "rz_pass_att"));
+		put("rz_car", num(p, "rz_carries"));
+		return out;
+	}
+	put("rz_tgt", num(p, "rz_targets"));
+	put("ez_tgt", num(p, "ez_targets"));
+	put("deep_tgt", num(p, "deep_targets"));
+	put("rz_car", num(p, "rz_carries"));
+	put("gl_car", num(p, "i5_carries"));
+	return out;
+}
+
+/** Window totals plus team shares for the per_game block. */
+function redZoneTotals(rows: Row[], pos: string, games: number): Row {
+	const sum = (k: string) => rows.reduce((a, r) => a + num(r, k), 0);
+	const share = (k: string) => {
+		const xs = rows.map((r) => r[k]).filter((v): v is number => typeof v === "number");
+		return xs.length ? pct(avg(xs)) : undefined;
+	};
+	if (pos === "QB") return { rz_att: round(sum("rz_pass_att") / games, 1), rz_car: round(sum("rz_carries") / games, 1) };
+	const out: Row = {
+		rz_tgt: round(sum("rz_targets") / games, 1),
+		ez_tgt: round(sum("ez_targets") / games, 1),
+		deep_tgt: round(sum("deep_targets") / games, 1),
+	};
+	const tShare = share("rz_target_share");
+	if (tShare != null && sum("rz_targets")) out.rz_tgt_share = tShare;
+	if (pos === "RB" || sum("rz_carries")) {
+		out.rz_car = round(sum("rz_carries") / games, 1);
+		out.gl_car = round(sum("i5_carries") / games, 1);
+		const cShare = share("rz_carry_share");
+		if (cShare != null && sum("rz_carries")) out.rz_car_share = cShare;
+	}
+	return out;
+}
+
+/** Next Gen Stats averaged over the weeks a player qualified. */
+function nextGen(rows: Row[], pos: string): Row {
+	const m = (k: string, digits = 1) => round(avg(rows.map((r) => num(r, k))), digits);
+	const base = { weeks: rows.length };
+	if (pos === "QB") {
+		return { ...base, cpoe: m("cpoe"), time_to_throw: m("avg_time_to_throw", 2), aggressiveness: m("aggressiveness"), adot: m("avg_intended_air_yards"), air_to_sticks: m("avg_air_yards_to_sticks") };
+	}
+	if (pos === "RB") {
+		return { ...base, ryoe_per_att: m("ryoe_per_att", 2), rush_pct_over_expected: pct(m("rush_pct_over_expected", 3)), eight_box_pct: m("eight_box_pct"), time_to_los: m("avg_time_to_los", 2), efficiency: m("efficiency", 2) };
+	}
+	return { ...base, separation: m("avg_separation", 2), cushion: m("avg_cushion", 2), adot: m("avg_intended_air_yards"), share_of_team_air_yards: m("share_of_intended_air_yards"), yac_over_expected: m("avg_yac_above_expectation", 2), catch_pct: m("catch_percentage") };
+}
+

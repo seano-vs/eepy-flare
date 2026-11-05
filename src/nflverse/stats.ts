@@ -114,15 +114,55 @@ export class NflData {
 		return r[0]?.w ?? 0;
 	}
 
-	/** sleeper_id -> { gsis_id, pfr_id } */
-	async ids(sleeperIds: string[]): Promise<Map<string, { gsis_id: string | null; pfr_id: string | null }>> {
-		const out = new Map<string, { gsis_id: string | null; pfr_id: string | null }>();
-		if (!sleeperIds.length) return out;
-		const rows = await this.all<{ sleeper_id: string; gsis_id: string | null; pfr_id: string | null }>(
-			`SELECT sleeper_id, gsis_id, pfr_id FROM nfl_player_ids WHERE sleeper_id IN (${sleeperIds.map(() => "?").join(",")})`,
-			...sleeperIds,
-		);
-		for (const r of rows) out.set(r.sleeper_id, { gsis_id: r.gsis_id, pfr_id: r.pfr_id });
+	/** sleeper_id -> { gsis_id, pfr_id, fantasypros_id } */
+	async ids(sleeperIds: string[]): Promise<Map<string, PlayerIds>> {
+		const out = new Map<string, PlayerIds>();
+		for (const part of chunks(sleeperIds)) {
+			const rows = await this.all<PlayerIds & { sleeper_id: string }>(
+				`SELECT sleeper_id, gsis_id, pfr_id, fantasypros_id FROM nfl_player_ids WHERE sleeper_id IN (${part.map(() => "?").join(",")})`,
+				...part,
+			);
+			for (const r of rows) out.set(r.sleeper_id, { gsis_id: r.gsis_id, pfr_id: r.pfr_id, fantasypros_id: r.fantasypros_id });
+		}
+		return out;
+	}
+
+	/** Rows for many players over a week range (ids chunked to stay under D1's 100 bound parameters). */
+	async forPlayers(table: string, idCol: "gsis_id" | "pfr_id", ids: string[], fromWeek: number, toWeek: number): Promise<Row[]> {
+		const out: Row[] = [];
+		for (const part of chunks([...new Set(ids)], 90)) {
+			out.push(
+				...(await this.all(
+					`SELECT * FROM ${table} WHERE season = ? AND week BETWEEN ? AND ? AND ${idCol} IN (${part.map(() => "?").join(",")})`,
+					this.season,
+					fromWeek,
+					toWeek,
+					...part,
+				)),
+			);
+		}
+		return out;
+	}
+
+	/** FantasyPros consensus rows for these FantasyPros ids (all kept pages). */
+	async ecr(fpIds: string[]): Promise<Row[]> {
+		const out: Row[] = [];
+		for (const part of chunks([...new Set(fpIds)])) {
+			out.push(...(await this.all(`SELECT * FROM nfl_ecr WHERE fantasypros_id IN (${part.map(() => "?").join(",")})`, ...part)));
+		}
+		return out;
+	}
+
+	/** Vegas implied points per (Sleeper-style) team for a week. */
+	async impliedTotals(week: number): Promise<Map<string, number>> {
+		const out = new Map<string, number>();
+		for (const g of await this.games(week)) {
+			const spread = g.spread_line;
+			const total = g.total_line;
+			if (typeof spread !== "number" || typeof total !== "number") continue;
+			out.set(sleeperTeam(g.home_team)!, round((total + spread) / 2, 1));
+			out.set(sleeperTeam(g.away_team)!, round((total - spread) / 2, 1));
+		}
 		return out;
 	}
 
@@ -196,6 +236,18 @@ export class NflData {
 	async status(): Promise<Row[]> {
 		return this.all("SELECT dataset, season, checked_at, changed_at, rows, note FROM nfl_sync ORDER BY dataset");
 	}
+}
+
+export interface PlayerIds {
+	gsis_id: string | null;
+	pfr_id: string | null;
+	fantasypros_id: string | null;
+}
+
+function chunks<T>(xs: T[], size = 90): T[][] {
+	const out: T[][] = [];
+	for (let i = 0; i < xs.length; i += size) out.push(xs.slice(i, i + size));
+	return out;
 }
 
 /** nflverse uses "LA" for the Rams; Sleeper uses "LAR". */

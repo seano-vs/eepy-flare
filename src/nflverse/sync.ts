@@ -9,11 +9,12 @@
 // Each chunk's rows and its new hash are written in the same D1 batch, so a
 // failure leaves the old hash in place and the chunk is retried next run.
 
+import { parquetReadObjects } from "hyparquet";
 import { parseCsvColumns } from "./csv";
 import { DATASETS, type ColumnSpec, type Dataset } from "./datasets";
 
 /** Bump when a table definition changes; tables are then dropped and rebuilt on the next sync. */
-export const SCHEMA_VERSION = "2";
+export const SCHEMA_VERSION = "3";
 
 type Value = string | number | null;
 
@@ -102,6 +103,31 @@ export function extractRows(d: Dataset, csvText: string, season: string): Value[
 	return out;
 }
 
+/** Rows for any dataset: plain CSV mapping, or a derived dataset built from CSV/Parquet records. */
+export async function extractAny(d: Dataset, body: string | ArrayBuffer, season: string): Promise<Value[][]> {
+	if (!d.derive) {
+		if (typeof body !== "string") throw new Error(`${d.id}: expected CSV text`);
+		return extractRows(d, body, season);
+	}
+	const cols = d.derive.columns;
+	let records: Record<string, unknown>[];
+	if (d.format === "parquet") {
+		if (typeof body === "string") throw new Error(`${d.id}: expected Parquet bytes`);
+		records = (await parquetReadObjects({ file: body, columns: cols })) as Record<string, unknown>[];
+		const missing = cols.filter((c) => records.length && !(c in records[0]!));
+		if (missing.length) throw new Error(`${d.id}: upstream columns missing: ${missing.join(", ")}`);
+		// Parquet INT64 columns come back as BigInt; normalise to numbers.
+		for (const r of records) for (const k of cols) if (typeof r[k] === "bigint") r[k] = Number(r[k]);
+	} else {
+		if (typeof body !== "string") throw new Error(`${d.id}: expected CSV text`);
+		const { header, rows } = parseCsvColumns(body, cols, d.prefilter?.(season));
+		const missing = cols.filter((c) => !header.includes(c));
+		if (missing.length) throw new Error(`${d.id}: upstream columns missing: ${missing.join(", ")}`);
+		records = rows.map((r) => Object.fromEntries(cols.map((c, i) => [c, r[i] === "NA" ? "" : r[i]])));
+	}
+	return d.derive.build(records, season);
+}
+
 // ---------------------------------------------------------------- SQL helpers
 
 function literal(v: Value): string {
@@ -149,8 +175,12 @@ async function fetchCsv(d: Dataset, url: string, etag: string | null) {
 	if (res.status === 304) return { status: 304 as const };
 	if (res.status === 404) return { status: 404 as const };
 	if (!res.ok) throw new Error(`${d.id}: HTTP ${res.status} from ${new URL(url).hostname}`);
-	const body =
-		d.gzip && res.body ? await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).text() : await res.text();
+	const body: string | ArrayBuffer =
+		d.format === "parquet"
+			? await res.arrayBuffer()
+			: d.gzip && res.body
+				? await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).text()
+				: await res.text();
 	return { status: 200 as const, body, etag: res.headers.get("etag"), lastModified: res.headers.get("last-modified") };
 }
 
@@ -177,7 +207,7 @@ export async function syncDataset(db: D1Database, d: Dataset, season: string, fo
 		return { dataset: d.id, status: "missing" };
 	}
 
-	const rows = extractRows(d, res.body, season);
+	const rows = await extractAny(d, res.body, season);
 	const chunkIdx = d.chunkBy.map((c) => d.columns.findIndex((x) => x.name === c));
 	const pkIdx = d.primaryKey.map((c) => d.columns.findIndex((x) => x.name === c));
 	const chunks = new Map<string, Value[][]>();

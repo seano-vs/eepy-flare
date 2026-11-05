@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseCsv, parseCsvColumns } from "../src/nflverse/csv";
-import { bucketOf, dataset } from "../src/nflverse/datasets";
+import { aggregatePbp, bucketOf, dataset, rankEcr } from "../src/nflverse/datasets";
+import { describeInjury, weeklyStale } from "../src/nflverse/context";
 import { expectedPoints, leaguePoints, sleeperTeam, unmappedRules } from "../src/nflverse/stats";
 import { extractRows } from "../src/nflverse/sync";
 
@@ -68,9 +69,9 @@ describe("extractRows", () => {
 	});
 	it("computes the ID-map bucket and drops rows without a Sleeper id", () => {
 		const d = dataset("player_ids");
-		const csv = "sleeper_id,gsis_id,pfr_id,name,position,team\n4984,00-0034857,AlleJo02,Josh Allen,QB,BUF\nNA,00-9,X,Nobody,QB,BUF\n123,00-8,Y,Lineman,OT,NE";
+		const csv = "sleeper_id,gsis_id,pfr_id,fantasypros_id,name,position,team\n4984,00-0034857,AlleJo02,19781,Josh Allen,QB,BUF\nNA,00-9,X,1,Nobody,QB,BUF\n123,00-8,Y,2,Lineman,OT,NE";
 		const rows = extractRows(d, csv, "2026");
-		expect(rows).toEqual([["4984", "00-0034857", "AlleJo02", "Josh Allen", "QB", "BUF", bucketOf("4984")]]);
+		expect(rows).toEqual([["4984", "00-0034857", "AlleJo02", "19781", "Josh Allen", "QB", "BUF", bucketOf("4984")]]);
 	});
 });
 
@@ -93,5 +94,56 @@ describe("league scoring on nflverse rows", () => {
 	it("normalises the Rams abbreviation", () => {
 		expect(sleeperTeam("LA")).toBe("LAR");
 		expect(sleeperTeam("KC")).toBe("KC");
+	});
+});
+
+describe("play-by-play aggregation", () => {
+	const play = (o: Record<string, unknown>) => ({ season: 2026, week: 8, posteam: "IND", two_point_attempt: 0, ...o });
+	const rows = aggregatePbp([
+		play({ play_type: "pass", yardline_100: 15, air_yards: 15, passer_player_id: "QB1", receiver_player_id: "WR1" }), // RZ + end-zone target
+		play({ play_type: "pass", yardline_100: 60, air_yards: 25, passer_player_id: "QB1", receiver_player_id: "WR1" }), // deep
+		play({ play_type: "pass", yardline_100: 8, air_yards: 3, passer_player_id: "QB1", receiver_player_id: "TE1" }), // RZ target
+		play({ play_type: "pass", yardline_100: 10, air_yards: null, passer_player_id: "QB1" }), // sack: not an attempt
+		play({ play_type: "run", yardline_100: 4, rusher_player_id: "RB1" }), // goal line
+		play({ play_type: "run", yardline_100: 18, rusher_player_id: "RB1" }),
+		play({ play_type: "run", yardline_100: 2, rusher_player_id: "RB1", two_point_attempt: 1 }), // ignored
+	]);
+	const by = (id: string) => rows.find((r) => r[2] === id)!;
+	// [season, week, gsis, team, rz_tgt, rz_tgt_share, ez_tgt, deep_tgt, rz_car, rz_car_share, i10, i5, rz_att]
+	it("counts red-zone, end-zone and deep targets with team share", () => {
+		expect(by("WR1").slice(4, 8)).toEqual([1, 0.5, 1, 1]);
+		expect(by("TE1").slice(4, 8)).toEqual([1, 0.5, 0, 0]);
+	});
+	it("counts red-zone and goal-line carries, skipping two-point tries", () => {
+		expect(by("RB1").slice(8, 12)).toEqual([2, 1, 1, 1]);
+	});
+	it("counts red-zone pass attempts but not sacks", () => {
+		expect(by("QB1")[12]).toBe(2);
+	});
+});
+
+describe("FantasyPros ECR", () => {
+	it("keeps superflex/positional pages and ranks by consensus", () => {
+		const rec = (page_type: string, id: string, ecr: string) => ({ page_type, id, player: id, pos: "WR", team: "DET", ecr, sd: "1", best: "1", worst: "3", scrape_date: "2026-10-30" });
+		const rows = rankEcr([rec("weekly-wr", "2", "3.5"), rec("weekly-wr", "1", "1.2"), rec("weekly-lb", "9", "1"), rec("weekly-wr", "x", "2")]);
+		expect(rows.map((r) => [r[0], r[1], r[5]])).toEqual([
+			["1", "weekly-wr", 1],
+			["2", "weekly-wr", 2],
+		]);
+	});
+	it("treats weekly ranks scraped before this week's Tuesday as stale", () => {
+		const thursday = new Date("2026-11-05T12:00:00Z");
+		expect(weeklyStale("2026-10-30", thursday)).toBe(true);
+		expect(weeklyStale("2026-11-03", thursday)).toBe(false);
+		expect(weeklyStale("2026-11-04", thursday)).toBe(false);
+		expect(weeklyStale("garbage", thursday)).toBe(true);
+	});
+});
+
+describe("injury descriptions", () => {
+	it("combines status, injury and practice", () => {
+		expect(describeInjury({ report_status: "Questionable", report_injury: "Ankle", practice_status: "Limited Participation in Practice" })).toBe("Questionable (Ankle), Limited");
+		expect(describeInjury({ report_status: "", practice_injury: "Hamstring", practice_status: "Did Not Participate In Practice" })).toBe("On report (Hamstring), DNP");
+		expect(describeInjury({})).toBeUndefined();
 	});
 });
