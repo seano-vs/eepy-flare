@@ -25,6 +25,14 @@ come out right without hand-tuned multipliers.
 | `project_player` | One player: this week's projection and key stats, rest-of-season points, VOR and season to date |
 | `compare_players` | 2–8 players side by side, for this week (start/sit) and rest of season |
 | `evaluate_trade` | Rest-of-season points and VOR given versus received, plus the effect on both teams' best lineup this week. In dynasty leagues it also gives a long-term verdict |
+| `get_player_usage` | Week-by-week usage for 1–6 players: snap share, targets, target and air-yards share, WOPR, carries, league-scored points versus expected points, and the current injury report |
+| `get_opportunity_leaders` | Rank players by expected points or usage over recent weeks. `available_only` finds waiver targets; `buy_low` / `sell_high` find players scoring well below or above their usage |
+| `get_injury_report` | Official injury report (game status and practice participation) for your roster, an NFL team, or another fantasy team |
+| `get_nfl_schedule` | A week's games with kickoff, spread, total, implied team totals, scores, and which of your players are in each game |
+| `get_nfl_data_status` | When each nflverse dataset was last checked and last changed |
+
+The last five use [nflverse](#nflverse-data-d1) data, the same files the
+[nflreadpy](https://pypi.org/project/nflreadpy/) and nflreadr packages download.
 
 All output is compact JSON, and player IDs are always resolved to `Name POS TEAM (injury)`.
 Any tool that takes a player accepts a name (`"Josh Allen"`, `"Allen BUF"`, `"St. Brown"`) or a
@@ -37,7 +45,8 @@ claude.ai ──POST /mcp──▶ Worker ──▶ createMcpHandler (stateless,
                             │
                             ├── Sleeper API (edge-cached via cf.cacheTtl + per-isolate memo)
                             ├── KV PLAYERS: compact players map  ◀── daily cron refresh
-                            └── KV PLAYERS: league-scored weekly projection pool (6h TTL)
+                            ├── KV PLAYERS: league-scored weekly projection pool (6h TTL)
+                            └── D1 NFL_DB: nflverse stats, snaps, injuries, xFP, schedule  ◀── hourly cron
 ```
 
 - **Transport.** The server uses `createMcpHandler` from `agents/mcp/server` together with
@@ -78,6 +87,40 @@ claude.ai ──POST /mcp──▶ Worker ──▶ createMcpHandler (stateless,
   draft picks aren't valued. The ADP comes from the undocumented season-projections endpoint
   (about 3 MB), is cached in KV for 12 hours, and the dynasty fields are left out if it fails.
 
+### nflverse data (D1)
+
+nflreadpy downloads [nflverse](https://github.com/nflverse/nflverse-data) CSV and parquet files and
+caches them on disk. Here the same files are mirrored into **D1** (Cloudflare's SQLite database),
+reduced to fantasy-relevant columns and QB/RB/WR/TE:
+
+| Table | Source | Upstream refresh |
+| --- | --- | --- |
+| `nfl_player_week` | `stats_player_week_{season}`: box scores, target share, air-yards share, WOPR, EPA | nightly after game days |
+| `nfl_snaps` | `snap_counts_{season}` (PFR) | 4× a day |
+| `nfl_injuries` | `injuries_{season}`: game status and practice participation | daily 07:00 UTC |
+| `nfl_opportunity` | [ffopportunity](https://github.com/ffverse/ffopportunity) `ep_weekly_{season}`: expected stats | nightly |
+| `nfl_games` | `schedules/games`: kickoff, scores, spread, total, moneylines | every 5 min |
+| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ids | daily |
+
+- **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
+  unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
+  column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
+  changed are rewritten. Stat corrections (by Wednesday night) touch a week or two, so a normal
+  update writes a few hundred rows, well inside D1's free 100,000 writes a day. The first sync
+  writes about 12,000 rows.
+- **Schema.** Tables are created by the first sync, so no migrations need to run in the build.
+  Changing a table definition bumps `SCHEMA_VERSION` in `src/nflverse/sync.ts`, and the next sync
+  drops and rebuilds everything from upstream.
+- **League scoring.** `pts` applies your league's `scoring_settings` to the nflverse box score.
+  For week 8 it matched Sleeper's official points for 136 of 137 rostered players; the one
+  difference was a stat Sleeper had and nflverse didn't. `xfp` re-scores ffopportunity's expected
+  yards, receptions, touchdowns and two-pointers with the same rules, so it reflects 6-point passing
+  TDs and any TE premium. Yardage-bucket bonuses can't be reproduced and are listed in the tool output.
+- **IDs.** nflverse uses GSIS and PFR ids. The DynastyProcess map links about 99% of fantasy-relevant
+  players to Sleeper ids. Unmapped players still appear in rankings under their nflverse name.
+- **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
+  nflverse (nflverse.com), ffverse, and DynastyProcess.
+
 ## Setup
 
 You need Node 20+ and a Cloudflare account. The Workers free plan is enough to serve tools; see
@@ -103,6 +146,18 @@ npx wrangler kv namespace create OAUTH_KV    # only used in phase 2, but the bin
 Paste each returned `id` into `wrangler.jsonc`, replacing `REPLACE_WITH_PLAYERS_KV_ID` and
 `REPLACE_WITH_OAUTH_KV_ID`. Answer **no** if Wrangler offers to add the bindings for you, because
 they're already in the file.
+
+Then create the D1 database for nflverse data, and paste its `database_id` in place of
+`REPLACE_WITH_NFL_D1_ID`:
+
+```sh
+npx wrangler d1 create eepy-flare-nfl
+```
+
+In the dashboard, this is **Storage & Databases → D1 SQL Database → Create**. You don't need to run
+any SQL, because the first hourly sync creates the tables. Locally, trigger it with
+`curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=23+*+*+*+*"` under
+`npx wrangler dev --test-scheduled`.
 
 ### 3. Set the vars
 
@@ -194,7 +249,41 @@ The GitHub token is used once to read your login and is never stored. CSRF prote
 one-time `state`, frame blocking and escaping on the consent page all come from the library's
 consent and upstream helpers.
 
-### Setup
+#### nflverse data (D1)
+
+nflreadpy downloads [nflverse](https://github.com/nflverse/nflverse-data) CSV and parquet files and
+caches them on disk. Here the same files are mirrored into **D1** (Cloudflare's SQLite database),
+reduced to fantasy-relevant columns and QB/RB/WR/TE:
+
+| Table | Source | Upstream refresh |
+| --- | --- | --- |
+| `nfl_player_week` | `stats_player_week_{season}`: box scores, target share, air-yards share, WOPR, EPA | nightly after game days |
+| `nfl_snaps` | `snap_counts_{season}` (PFR) | 4× a day |
+| `nfl_injuries` | `injuries_{season}`: game status and practice participation | daily 07:00 UTC |
+| `nfl_opportunity` | [ffopportunity](https://github.com/ffverse/ffopportunity) `ep_weekly_{season}`: expected stats | nightly |
+| `nfl_games` | `schedules/games`: kickoff, scores, spread, total, moneylines | every 5 min |
+| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ids | daily |
+
+- **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
+  unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
+  column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
+  changed are rewritten. Stat corrections (by Wednesday night) touch a week or two, so a normal
+  update writes a few hundred rows, well inside D1's free 100,000 writes a day. The first sync
+  writes about 12,000 rows.
+- **Schema.** Tables are created by the first sync, so no migrations need to run in the build.
+  Changing a table definition bumps `SCHEMA_VERSION` in `src/nflverse/sync.ts`, and the next sync
+  drops and rebuilds everything from upstream.
+- **League scoring.** `pts` applies your league's `scoring_settings` to the nflverse box score.
+  For week 8 it matched Sleeper's official points for 136 of 137 rostered players; the one
+  difference was a stat Sleeper had and nflverse didn't. `xfp` re-scores ffopportunity's expected
+  yards, receptions, touchdowns and two-pointers with the same rules, so it reflects 6-point passing
+  TDs and any TE premium. Yardage-bucket bonuses can't be reproduced and are listed in the tool output.
+- **IDs.** nflverse uses GSIS and PFR ids. The DynastyProcess map links about 99% of fantasy-relevant
+  players to Sleeper ids. Unmapped players still appear in rankings under their nflverse name.
+- **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
+  nflverse (nflverse.com), ffverse, and DynastyProcess.
+
+## Setup
 
 1. **Create two GitHub OAuth apps** at <https://github.com/settings/developers> (**OAuth Apps → New**):
    - Local: homepage `http://localhost:8787`, callback `http://localhost:8787/callback`
@@ -228,8 +317,9 @@ To test locally, run `npm run dev` with the phase 2 values in `.dev.vars`. In MC
 - **Requests to Sleeper.** League endpoints are cached for 30 seconds to 5 minutes, and projections
   for 30 minutes, at the edge and in memory. Normal use stays far below Sleeper's limit of
   1000 requests per minute.
-- **CPU.** Tool calls do little work. The two heavier steps are parsing the 15 MB players dump in
-  the cron and the 2 MB weekly projection pool, which happens at most every 6 hours. On the
+- **CPU.** Tool calls do little work. The heavier steps are parsing the 15 MB players dump in the
+  daily cron, the 2 MB weekly projection pool (at most every 6 hours), and parsing an nflverse file
+  when it changes (about 70–80 ms for all of them together; unchanged files cost nothing). On the
   **Workers Paid** plan both fit comfortably. On the free plan (10 ms CPU), the cron refresh may hit
   the CPU limit. If it does, run `npm run seed-players` from your machine once a day, or whenever
   rosters change a lot. It does the parsing locally and only uploads the compact blob.
@@ -244,7 +334,7 @@ serve `/mcp` from a custom domain, add it to `ALLOWED_HOSTNAMES`.
 
 ```sh
 npm run typecheck
-npm test                 # vitest: scoring, replacement level, lineup optimizer, name resolution, allowlist
+npm test                 # vitest: scoring, replacement level, lineup optimizer, name resolution, allowlist, CSV/nflverse
 ```
 
 | Path | Purpose |
@@ -258,3 +348,9 @@ npm test                 # vitest: scoring, replacement level, lineup optimizer,
 | `src/players.ts` | KV players cache: load, refresh, search and resolve |
 | `src/compact-players.ts` | Dump compaction, shared with `scripts/seed-players.mjs` |
 | `src/sleeper.ts` | Sleeper API client and types |
+| `src/nfl-tools.ts` | Tools backed by nflverse data |
+| `src/nflverse/datasets.ts` | Which nflverse files, columns and rows are mirrored |
+| `src/nflverse/sync.ts` | Hourly sync into D1: conditional downloads, per-week hashing, batched writes |
+| `src/nflverse/csv.ts` | CSV parsing, including the column-selective fast path |
+| `src/nflverse/stats.ts` | League-scored actual and expected points, and D1 queries |
+| `src/result.ts` | Shared tool-result helpers |

@@ -32,6 +32,12 @@ const calls = [
 	["project_player", { player: "Josh Allen", include_weekly: true }],
 	["compare_players", { players: ["Bijan Robinson", "Jahmyr Gibbs", "Lamar Jackson"] }],
 	["evaluate_trade", { give: [process.env.GIVE ?? "Josh Allen"], get: [process.env.GET ?? "Ja'Marr Chase"] }],
+	["get_player_usage", { players: ["Josh Allen", "Bijan Robinson"], weeks: 3 }],
+	["get_opportunity_leaders", { position: "WR", available_only: true, limit: 5 }],
+	["get_opportunity_leaders", { sort: "buy_low", limit: 5 }],
+	["get_injury_report", {}],
+	["get_nfl_schedule", {}],
+	["get_nfl_data_status", {}],
 ];
 
 let failed = 0;

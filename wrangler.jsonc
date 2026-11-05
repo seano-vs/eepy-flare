@@ -16,8 +16,16 @@
     { "binding": "OAUTH_KV", "id": "22a20c308259487a89174b7b235ae334" }
   ],
 
-  // Sleeper asks that /players/nfl be fetched at most once per day.
-  "triggers": { "crons": ["17 9 * * *"] },
+  // nflverse stats, snaps, injuries, expected points and schedules (see src/nflverse).
+  // Create with `npx wrangler d1 create eepy-flare-nfl` (or the dashboard) and paste the id here.
+  // Tables are created automatically by the first sync.
+  "d1_databases": [
+    { "binding": "NFL_DB", "database_name": "eepy-flare-nfl", "database_id": "REPLACE_WITH_NFL_D1_ID" }
+  ],
+
+  // 09:17 UTC daily: Sleeper players dump (Sleeper asks for at most one fetch per day).
+  // :23 hourly: nflverse sync; unchanged files return 304 and are skipped.
+  "triggers": { "crons": ["17 9 * * *", "23 * * * *"] },
 
   "vars": {
     // Set these to your league and Sleeper user. Both are public numeric ids.

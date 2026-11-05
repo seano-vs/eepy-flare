@@ -1,7 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { LeagueContext } from "./league";
-import type { Player, PlayerRef } from "./players";
 import {
 	computeReplacement,
 	lastFantasyWeek,
@@ -14,29 +13,14 @@ import {
 	type Replacement,
 } from "./scoring";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
+import { READ_ONLY, fail, fmt, ok } from "./result";
+import { registerNflTools } from "./nfl-tools";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
+
+export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
 export const SERVER_VERSION = "1.0.0";
-
-const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
-
-type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
-
-function ok(data: unknown): ToolResult {
-	return { content: [{ type: "text", text: JSON.stringify(data) }] };
-}
-
-function fail(err: unknown): ToolResult {
-	const message = err instanceof Error ? err.message : String(err);
-	return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
-}
-
-/** "Josh Allen QB BUF (Questionable)" — the compact form used in every list. */
-export function fmt(p: PlayerRef | Player): string {
-	if (p.id === "0") return "(empty)";
-	return `${p.name} ${p.pos} ${p.team ?? "FA"}${p.injury ? ` (${p.injury})` : ""}`;
-}
 
 const weekArg = z
 	.number()
@@ -645,6 +629,8 @@ export function createServer(env: Env): McpServer {
 			}
 		},
 	);
+
+	registerNflTools(server, env);
 
 	return server;
 }
