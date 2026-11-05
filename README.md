@@ -269,6 +269,23 @@ Since 1.5:
 - **Byes.** `get_player_usage` shows bye weeks and missed weeks as rows; `get_nfl_schedule` with a
   team on bye says so.
 - **Schema changes.** When one dataset's columns change, only that table is rebuilt.
+
+Since 1.6:
+
+- **Freshness stamps.** Every response that uses estimates or mirrored data has an `as_of` block:
+  when each source it used was last updated, in Eastern time with its age, and `- stale` past a
+  limit (injury tags 30h, projections 3h, lines 48h, FantasyPros 7 days, ADP 24h, weather 3h).
+  It covers the players cache, projections, ADP, nflverse stats, Vegas lines, FantasyPros,
+  weather, and the injury report per team in the response. nflverse's report file has no
+  per-row time, so the hourly cron logs when each team's report for the week reached the mirror
+  and when it last changed (KV `reports:<season>`). "In mirror by" means the report was already
+  there when tracking began.
+- **Absolute times on items.** News lines read `Title (rotowire +fantasy_pros, Wed, Nov 4, 9:14 PM
+  ET, 12h ago)`, so a report read later still dates correctly; `get_player_news` items carry
+  `published_et`. Practice status read from headlines carries its publish time too.
+- **Derived numbers name their basis.** `play_basis` says which designation, practice and report
+  week a `play_pct` came from, or that it's preliminary.
+- `injury_tags_as_of`, `projections_fetched_at` and `fetched_at` are replaced by `as_of`.
 - **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
   that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
   from the original owner's standing (worst record picks first). `traded_picks` determines who owns

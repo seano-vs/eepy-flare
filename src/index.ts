@@ -5,6 +5,7 @@ import { syncAll } from "./nflverse/sync";
 import { refreshPlayers } from "./players";
 import { LeagueContext } from "./league";
 import { saveSnapshot } from "./changes";
+import { recordReports } from "./asof";
 import { sleeper } from "./sleeper";
 import { SERVER_NAME, SERVER_VERSION, createServer } from "./tools";
 
@@ -55,7 +56,7 @@ export default {
 					(e: unknown) => e,
 				);
 				await LeagueContext.load(env)
-					.then(saveSnapshot)
+					.then((lc) => Promise.all([saveSnapshot(lc), recordReports(lc)]))
 					.catch((e) => console.error("snapshot failed", e));
 				if (sync) throw sync;
 			})(),

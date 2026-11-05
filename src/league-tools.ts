@@ -2,9 +2,10 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { asOf } from "./asof";
 import { LeagueContext } from "./league";
 import { isUnavailable } from "./nflverse/context";
-import { playerNews } from "./news";
+import { newsLine, playerNews } from "./news";
 import { activeIds, loadSeason, runOdds } from "./playoffs";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { optimalLineup, round } from "./scoring";
@@ -40,6 +41,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 				const rows = standingRows(lc, season).map((r) => ({ ...r, ...sim.odds.get(r.roster_id), ...(r.roster_id === mine ? { is_me: true } : {}) }));
 				rows.sort((a, b) => (b.playoffs ?? 0) - (a.playoffs ?? 0));
 				return ok({
+					as_of: await asOf(lc, ["projections", "transactions"]),
 					completed_weeks: season.completed,
 					simulated_weeks: `${season.weeks[0]}-${season.regEnd}`,
 					playoff_teams: Number(lc.league.settings.playoff_teams) || 6,
@@ -156,6 +158,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 						};
 					});
 				return ok({
+					as_of: await asOf(lc, ["projections", "transactions"]),
 					weeks: season.weeks.slice(0, 2).join(", "),
 					teams: out,
 					note:
@@ -190,6 +193,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 				const maxAgeHours = (days ?? 7) * 24;
 				const news = await Promise.all(ids.map((id) => playerNews(id, { limit: limit ?? 3, maxAgeHours })));
 				return ok({
+					as_of: await asOf(lc, ["news"]),
 					players: ids.map((id, i) => ({ player: fmt(lc.ref(id)), ...(news[i]!.length ? { news: news[i] } : { news: [], note: `No news in the last ${days ?? 7} days.` }) })),
 					note: "Sleeper's news feed is undocumented; items are third-party blurbs with their own sourcing. Check the timestamp before acting on one.",
 				});
@@ -256,7 +260,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 							...(last ? { last_move: eastern(last) } : { last_move: "no moves this season" }),
 						};
 					});
-				return ok({ season_weeks: `1-${lc.week}`, managers: profiles, note: "From Sleeper transactions this season (completed moves; losing bids are failed claims)." });
+				return ok({ as_of: await asOf(lc, ["transactions"]), season_weeks: `1-${lc.week}`, managers: profiles, note: "From Sleeper transactions this season (completed moves; losing bids are failed claims)." });
 			} catch (e) {
 				return fail(e);
 			}
@@ -302,12 +306,13 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 						...(t.type === "waiver" && t.settings?.waiver_bid != null ? { bid: t.settings.waiver_bid } : {}),
 					}));
 				return ok({
+					as_of: await asOf(lc, ["news", "transactions", "injury_tags", "injury_report"], { teams: ids.map((id) => lc.players.get(id)?.team) }),
 					since: eastern(sinceMs),
 					...(before ? { compared_with_snapshot: eastern(Date.parse(before.at)) } : { note_snapshots: "No snapshot that old yet (snapshots are hourly, kept 14 days), so status and projection changes are missing." }),
 					player_changes: playerChanges.map((c) => ({ player: fmt(lc.ref(c.id)), ...(scope === "league" && owned.has(c.id) ? { team: lc.team(owned.get(c.id)!).owner } : {}), changes: c.changes })),
 					headlines: news
 						.filter(([, n]) => n.length)
-						.map(([id, n]) => ({ player: fmt(lc.ref(id)), news: n.map((x) => `${x.title} (${x.source}, ${x.age_hours}h ago)`) })),
+						.map(([id, n]) => ({ player: fmt(lc.ref(id)), news: n.map((x) => newsLine(x)) })),
 					transactions: moves,
 					note: "Injury tags come from the daily players cache, so tag changes show up once a day; game status and practice come from nflverse's report mirror.",
 				});

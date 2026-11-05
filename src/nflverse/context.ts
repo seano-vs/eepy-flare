@@ -42,6 +42,8 @@ export interface PlayerContext {
 	injury_report?: string;
 	/** Chance a Questionable player plays, from 2016-2025 base rates by last practice (see playProbability). */
 	play_pct?: number;
+	/** What play_pct was computed from, e.g. "Questionable, Limited at last practice (week 9 report)". */
+	play_basis?: string;
 	play_note?: string;
 }
 
@@ -256,6 +258,11 @@ export async function playerContext(
 				const pct = playProbability(status, thisWeek ? (inj.practice_status as string) : undefined, pl?.pos);
 				if (pct != null && pct > 0 && pct < 100) {
 					ctx.play_pct = pct;
+					const prac = thisWeek ? PRACTICE[String(inj.practice_status)] ?? (inj.practice_status as string | undefined) : undefined;
+					ctx.play_basis =
+						thisWeek && inj.report_status
+							? `${status}${prac ? `, ${prac} at last practice` : ""} (week ${inj.week} report)`
+							: `Sleeper tag ${status}${prac ? `, ${prac} at last practice (week ${inj.week} report, no game status yet)` : ` (no week ${injuries.week} report in nflverse yet)`}`;
 					const prelim = !(thisWeek && inj.report_status);
 					if (pct < 90 || prelim)
 						ctx.play_note =

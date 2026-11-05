@@ -3,13 +3,14 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { asOf } from "./asof";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { LeagueContext } from "./league";
 import { isUnavailable, playerContext } from "./nflverse/context";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { rankWaiverTargets } from "./waiver-targets";
 import { readPrefs } from "./prefs";
-import { latestHeadlines, playerNews, roleSignal } from "./news";
+import { latestHeadlines, newsLine, playerNews, roleSignal } from "./news";
 import { NflData, expectedPoints } from "./nflverse/stats";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { computeReplacement, lastFantasyWeek, optimalLineup, round, weekPool, type SkillPos } from "./scoring";
@@ -406,7 +407,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						...(() => {
 							const n = rankedBy.get(sid)?.news ?? singleNews[0];
 							const sig = rankedBy.get(sid)?.role_news ?? (n ? roleSignal(n.title) : null);
-							return { ...(n ? { news: `${n.title} (${n.source}, ${n.age_hours}h ago)` } : {}), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}) };
+							return { ...(n ? { news: newsLine(n) } : {}), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}) };
 						})(),
 						...(c?.recent ? { recent: { snap_pct: c.recent.snap_pct, targets: c.recent.targets, carries: c.recent.carries, rz_opps: c.recent.rz_opps } } : {}),
 						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
@@ -449,6 +450,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					};
 				});
 				return ok({
+					as_of: await asOf(lc, ["projections", "stats", "news", "transactions", "injury_tags"]),
 					budget,
 					my_remaining: myLeft,
 					...(schedule ? { waivers: { main_run: schedule.main_run, processes_at: schedule.processes_at?.eastern ?? null, clear_days: schedule.clear_days } } : {}),
@@ -619,7 +621,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 							...(c?.injury_report ? { injury_report: c.injury_report } : {}),
 							...(c?.role_change ? { role_change: c.role_change } : {}),
 							...(c?.projection_check ? { projection_check: c.projection_check } : {}),
-							...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}),
+							...(h ? { news: newsLine(h) } : {}),
 							...(discounted.has(id) ? { projection_discounted: "Sleeper's projection assumes a bigger role than recent usage; scored halfway to recent expected points." } : {}),
 							// Sleeper projection per game in the weeks of the window he's projected to play.
 							proj_ppg_window: a.ppg,
@@ -629,6 +631,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						};
 					});
 				return ok({
+					as_of: await asOf(lc, ["projections", "stats", "injury_report", "news", "injury_tags", ...(dynasty ? (["adp"] as const) : [])]),
 					focus: mode,
 					...(prefs.untouchableNames.length ? { untouchables: prefs.untouchableNames } : {}),
 					weeks: `${lc.week}-${through}`,

@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { asOf } from "./asof";
 import { LeagueContext } from "./league";
 import {
 	poolFetchedAt,
@@ -20,12 +21,12 @@ import { registerNflTools } from "./nfl-tools";
 import { pickSchema, registerAdvisorTools, valuePicks } from "./advisor";
 import { registerLeagueTools } from "./league-tools";
 import { readPrefs } from "./prefs";
-import { gameWeather, type GameWeather } from "./weather";
+import { gameWeather, weatherFetchedAt, type GameWeather } from "./weather";
 import { lockTimeline, type LockCandidate, type LockStarter } from "./locks";
 import { clock, eastern } from "./waivers";
 import { parseSince } from "./changes";
 import { NflData, sleeperTeam } from "./nflverse/stats";
-import { latestHeadlines, playerNews, practiceFromNews, roleSignal, type PracticeNews } from "./news";
+import { latestHeadlines, newsLine, playerNews, practiceFromNews, practiceLine, type PracticeNews, roleSignal } from "./news";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { activeIds, computedRecords, loadSeason, recordString, runOdds } from "./playoffs";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
@@ -33,7 +34,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.5.0";
+export const SERVER_VERSION = "1.6.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -52,7 +53,7 @@ export const INSTRUCTIONS =
 	"check current, dated news for each player it depends on: injury and practice reports, suspensions, depth chart, recent snap " +
 	"and target share, QB changes. Explain any zero, drop or return date you rely on. Each player's `verify` list names the " +
 	"projection assumptions to check first. A gap of a point or two between players is noise; decide close calls on role, health " +
-	"and matchup. Injury tags come from a once-a-day players cache (see injury_tags_as_of), so they can trail the latest reports.";
+	"and matchup. Every response has an as_of block: when each source it used was last updated (Eastern time), marked stale past its limit. Injury tags come from a once-a-day players cache and the official report reaches the mirror hours after teams post, so weigh old data accordingly and cite times when they matter.";
 
 const PREGAME_NOTE =
 	"proj and projected_pregame are pregame projections. Once a player's game is over, count his pts instead of his proj; projected_pregame still uses the proj.";
@@ -208,11 +209,11 @@ export function createServer(env: Env): McpServer {
 						...(pl?.injury_start ? { injured_since: pl.injury_start } : {}),
 						...(pl?.depth ? { depth: pl.depth } : {}),
 						...(team && implied.has(team) ? { implied: implied.get(team), ...impliedDelta(implied.get(team), norms.get(team)) } : {}),
-						...(c?.play_pct != null ? { play_pct: c.play_pct, ...(c.play_note ? { play_note: c.play_note } : {}) } : {}),
+						...(c?.play_pct != null ? { play_pct: c.play_pct, ...(c.play_basis ? { play_basis: c.play_basis } : {}), ...(c.play_note ? { play_note: c.play_note } : {}) } : {}),
 						...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
 						...(c?.role_change ? { role_change: c.role_change } : {}),
 				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
-						...(n ? { news: `${n.title} (${n.source}, ${n.age_hours}h ago)` } : {}),
+						...(n ? { news: newsLine(n) } : {}),
 						...(team && weather.get(team)?.flags ? { weather: `${weather.get(team)!.flags!.join("; ")} (${weather.get(team)!.wind_mph} mph, ${weather.get(team)!.temp_f}F)` } : {}),
 						...(verify ? { verify } : {}),
 					};
@@ -237,7 +238,6 @@ export function createServer(env: Env): McpServer {
 					week: w,
 					starters,
 					bench,
-					injury_tags_as_of: lc.players.updated,
 				};
 				if (r.reserve?.length) out.ir = r.reserve.map((id) => fmt(lc.ref(id)));
 				if (r.taxi?.length) out.taxi = r.taxi.map((id) => fmt(lc.ref(id)));
@@ -255,7 +255,7 @@ export function createServer(env: Env): McpServer {
 							week: reports.week,
 							teams: pending,
 							...(prac.size
-								? { practice_from_news: Object.fromEntries([...prac].map(([id, p]) => [fmt(lc.ref(id)), `${p.practice}${p.day ? ` ${p.day}` : ""} (${p.source}, ${p.age_hours}h ago)`])) }
+								? { practice_from_news: Object.fromEntries([...prac].map(([id, p]) => [fmt(lc.ref(id)), practiceLine(p)])) }
 								: {}),
 							note: "These teams' week reports aren't in nflverse yet (it updates a few times a day; the team may already have posted). No row doesn't mean healthy. practice_from_news is read from headlines.",
 						};
@@ -321,9 +321,6 @@ export function createServer(env: Env): McpServer {
 						console.warn("lock timeline unavailable:", e instanceof Error ? e.message : e);
 					}
 				}
-				out.fetched_at = new Date().toISOString();
-				const pf = poolFetchedAt.get(`${lc.season}:${w}`);
-				if (pf) out.projections_fetched_at = pf;
 
 				if (pool.size) {
 					const active = (r.players ?? []).filter((id) => !reserve.has(id));
@@ -344,6 +341,10 @@ export function createServer(env: Env): McpServer {
 				} else {
 					out.projections = "unavailable (Sleeper projections endpoint did not respond as expected)";
 				}
+				out.as_of = await asOf(lc, ["injury_tags", "projections", "injury_report", "lines", "rankings", "stats", "news", ...(weather.size ? (["weather"] as const) : [])], {
+					teams: ids.map((id) => lc.players.get(id)?.team),
+					weatherAt: weatherFetchedAt(weather.values()),
+				});
 				return ok(out);
 			} catch (e) {
 				return fail(e);
@@ -432,6 +433,7 @@ export function createServer(env: Env): McpServer {
 						byId.set(m.matchup_id, [...(byId.get(m.matchup_id) ?? []), m]);
 					}
 					return ok({
+						as_of: await asOf(lc, ["projections"]),
 						week: w,
 						matchups: [...byId.entries()]
 							.sort((a, b) => a[0] - b[0])
@@ -445,11 +447,11 @@ export function createServer(env: Env): McpServer {
 				if (!mine) return ok({ week: w, note: `${lc.team(roster.roster_id).owner} has no matchup in week ${w}.` });
 				const opp = mine.matchup_id != null ? matchups.find((m) => m.matchup_id === mine.matchup_id && m.roster_id !== mine.roster_id) : undefined;
 				return ok({
+					as_of: await asOf(lc, ["injury_tags", "projections", "news"]),
 					week: w,
 					status: w < lc.week ? "final" : w === lc.week ? "current" : "upcoming",
 					team: side(mine, true),
 					opponent: opp ? side(opp, true) : null,
-					injury_tags_as_of: lc.players.updated,
 					...(pool.size ? { note: PREGAME_NOTE } : {}),
 				});
 			} catch (e) {
@@ -579,7 +581,7 @@ export function createServer(env: Env): McpServer {
 							...(() => {
 								const h = heads.get(t.player_id);
 								const sig = h ? roleSignal(h.title) : null;
-								return { ...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}) };
+								return { ...(h ? { news: newsLine(h) } : {}), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}) };
 							})(),
 							...(waivers.get(t.player_id) ? { waiver: waivers.get(t.player_id) } : {}),
 							...(!onlyAvail && owned.has(t.player_id) ? { rostered_by: lc.team(owned.get(t.player_id)!).owner } : {}),
@@ -587,6 +589,7 @@ export function createServer(env: Env): McpServer {
 					});
 					if (nflCtx.size) out.legend = CONTEXT_LEGEND + " ros_rank = FantasyPros rest-of-season positional rank.";
 				}
+				out.as_of = await asOf(lc, ["projections", "stats", "rankings", "news", "transactions"]);
 				return ok(out);
 			} catch (e) {
 				return fail(e);
@@ -721,8 +724,8 @@ export function createServer(env: Env): McpServer {
 				...(c?.role_change ? { role_change: c.role_change } : {}),
 				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
 				...(c?.injury_report ? { injury_report: c.injury_report } : {}),
-				...(c?.play_pct != null ? { play_pct: c.play_pct } : {}),
-				...(news[i]!.length ? { news: news[i]!.map((n) => `${n.title} (${n.source}, ${n.age_hours}h ago)`) } : {}),
+				...(c?.play_pct != null ? { play_pct: c.play_pct, ...(c.play_basis ? { play_basis: c.play_basis } : {}) } : {}),
+				...(news[i]!.length ? { news: news[i]!.map((n) => newsLine(n)) } : {}),
 			};
 		});
 		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp };
@@ -748,11 +751,11 @@ export function createServer(env: Env): McpServer {
 				const lc = await ctx();
 				const v = await valuations(lc, [player], week, include_weekly ?? false);
 				return ok({
+					as_of: await asOf(lc, ["injury_tags", "projections", "injury_report", "lines", "rankings", "stats", "news", ...(v.dynasty ? (["adp"] as const) : [])], { teams: v.players.map((p) => p.team) }),
 					week: v.week,
 					through_week: v.through_week,
 					...v.rows[0],
 					...(v.repl ? { replacement_level_week: v.repl.level } : { note: "Replacement level unavailable; VOR equals raw points." }),
-					injury_tags_as_of: lc.players.updated,
 				});
 			} catch (e) {
 				return fail(e);
@@ -783,6 +786,7 @@ export function createServer(env: Env): McpServer {
 				const byWeek = [...v.rows].sort((a, b) => num(b, "week_pts") - num(a, "week_pts"));
 				const byRos = [...v.rows].sort((a, b) => num(b, "ros_vor") - num(a, "ros_vor"));
 				return ok({
+					as_of: await asOf(lc, ["injury_tags", "projections", "injury_report", "lines", "rankings", "stats", "news", ...(v.dynasty && !hide ? (["adp"] as const) : [])], { teams: v.players.map((p) => p.team) }),
 					week: v.week,
 					through_week: v.through_week,
 					...(v.repl ? { replacement_level_week: v.repl.level, league_starters: v.repl.starters } : {}),
@@ -793,7 +797,6 @@ export function createServer(env: Env): McpServer {
 					...(v.dynasty && !hide
 						? { best_dynasty: [...v.rows].sort((a, b) => num(b, "dynasty_value") - num(a, "dynasty_value"))[0]?.player }
 						: {}),
-					injury_tags_as_of: lc.players.updated,
 				});
 			} catch (e) {
 				return fail(e);
@@ -902,6 +905,7 @@ export function createServer(env: Env): McpServer {
 				const dynastyVerdict =
 					Math.abs(dynPct) < 0.1 ? "roughly even" : dynPct > 0 ? (dynPct > 0.25 ? "clearly favors you" : "favors you") : dynPct < -0.25 ? "clearly favors them" : "favors them";
 				return ok({
+					as_of: await asOf(lc, ["injury_tags", "projections", "injury_report", "lines", "rankings", "stats", "news", ...(v.dynasty && !hide ? (["adp"] as const) : [])], { teams: v.players.map((p) => p.team) }),
 					from_perspective_of: lc.team(mine.roster_id).owner,
 					...(partner ? { partner: lc.team(partner.roster_id).owner } : {}),
 					weeks: `${v.week}-${v.through_week}`,
@@ -928,7 +932,6 @@ export function createServer(env: Env): McpServer {
 					...(playoffOdds ? { playoff_odds_pct: playoffOdds } : {}),
 					...(v.repl ? { replacement_level_week: v.repl.level, league_starters: v.repl.starters } : {}),
 					...(warnings.length ? { warnings } : {}),
-					injury_tags_as_of: lc.players.updated,
 					note:
 						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled: " +
 						"the verdicts are only as good as Sleeper's projections, so check each player's verify list and current news before acting." +
@@ -1058,10 +1061,10 @@ export function zeroProjectionNote(
 	hasGame: boolean,
 	tag: string | undefined,
 	report: string | undefined,
-	news?: { title: string; age_hours: number },
+	news?: { title: string; age_hours: number; published_et?: string },
 ): string | undefined {
 	if (proj !== 0 || !hasGame) return undefined;
-	if (news && news.age_hours <= 72) return `Projected 0 with a game this week. Latest news (${news.age_hours}h ago): "${news.title}". Confirm before benching or dropping.`;
+	if (news && news.age_hours <= 72) return `Projected 0 with a game this week. Latest news (${news.published_et ? `${news.published_et}, ` : ""}${news.age_hours}h ago): "${news.title}". Confirm before benching or dropping.`;
 	if (report) return `Projected 0 with a game this week. Official report: ${report}. Confirm he's ruled out before benching or dropping.`;
 	if (tag) return `Projected 0 with a game this week; listed ${tag}. Confirm his status in current news.`;
 	return "Projected 0 with a game this week and no injury or status listed. Sleeper doesn't say why (injury news, benching, depth chart?), so find a dated source before relying on it.";

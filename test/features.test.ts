@@ -216,3 +216,19 @@ describe("shortenedWeeks", () => {
 		expect(shortenedWeeks(rows.slice(0, 2)).size).toBe(0);
 	});
 });
+
+describe("freshness stamps", () => {
+	it("formats ET times with age and a stale marker", async () => {
+		const { stamp, ago } = await import("../src/asof");
+		const now = Date.parse("2026-11-05T15:00:00Z");
+		expect(stamp("2026-11-05T14:23:00Z", now)).toBe("Thu, Nov 5, 9:23 AM ET (37m ago)");
+		expect(stamp("2026-11-04T09:17:00Z", now, 24)).toBe("Wed, Nov 4, 4:17 AM ET (30h ago) - stale");
+		expect(stamp(null, now)).toBeNull();
+		expect(ago(now - 3 * 86_400_000, now)).toBe("3d ago");
+	});
+	it("puts absolute times and merged sources in news lines", async () => {
+		const { newsLine, parseNews } = await import("../src/news");
+		const [n] = parseNews([{ published: Date.parse("2026-11-05T02:14:00Z"), source: "rotowire", metadata: { title: "Rice limited Wednesday" } }], Date.parse("2026-11-05T14:14:00Z"));
+		expect(newsLine({ ...n!, also: ["fantasy_pros"] })).toBe("Rice limited Wednesday (rotowire +fantasy_pros, Wed, Nov 4, 9:14 PM ET, 12h ago)");
+	});
+});

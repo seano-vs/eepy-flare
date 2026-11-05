@@ -156,6 +156,6 @@ describe("server instructions", () => {
 	it("tell the model that projections are estimates to verify", () => {
 		expect(INSTRUCTIONS).toContain("not facts");
 		expect(INSTRUCTIONS).toContain("`verify` list");
-		expect(INSTRUCTIONS).toContain("injury_tags_as_of");
+		expect(INSTRUCTIONS).toContain("as_of block");
 	});
 });

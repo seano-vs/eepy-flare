@@ -32,6 +32,8 @@ export interface GameWeather {
 	precip_in?: number;
 	flags?: string[];
 	note?: string;
+	/** When the forecast was fetched from Open-Meteo (ms; responses are edge-cached up to 30 min). */
+	fetched_ms?: number;
 }
 
 interface Hourly {
@@ -62,7 +64,7 @@ export function summarizeForecast(h: Hourly, gameday: string, gametime: string):
 	return { temp_f: temp, wind_mph: wind, gusts_mph: gusts, precip_chance_pct: pop, precip_in: precip, ...(flags.length ? { flags } : {}) };
 }
 
-async function forecast(lat: number, lon: number, day: string): Promise<Hourly | null> {
+async function forecast(lat: number, lon: number, day: string): Promise<{ hourly: Hourly; fetched: number } | null> {
 	const url =
 		`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
 		"&hourly=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation_probability,precipitation" +
@@ -70,7 +72,9 @@ async function forecast(lat: number, lon: number, day: string): Promise<Hourly |
 	try {
 		const res = await fetch(url, { cf: { cacheTtl: 1800, cacheEverything: true } } as RequestInit);
 		if (!res.ok) return null;
-		return ((await res.json()) as { hourly?: Hourly }).hourly ?? null;
+		const hourly = ((await res.json()) as { hourly?: Hourly }).hourly;
+		const age = Number(res.headers.get("age") ?? 0);
+		return hourly ? { hourly, fetched: Date.now() - (Number.isFinite(age) ? age * 1000 : 0) } : null;
 	} catch {
 		return null;
 	}
@@ -95,9 +99,9 @@ export async function gameWeather(games: Row[], now = Date.now()): Promise<Map<s
 			else {
 				const [lat, lon] = STADIUMS[home]!;
 				const h = await forecast(lat, lon, day);
-				const s = h ? summarizeForecast(h, day, time) : null;
+				const s = h ? summarizeForecast(h.hourly, day, time) : null;
 				w = s
-					? { ...base, conditions: "forecast", ...s, ...(RETRACTABLE.has(home) ? { note: "Retractable roof: irrelevant if it's closed (decided on game day)." } : {}) }
+					? { ...base, conditions: "forecast", ...s, fetched_ms: h!.fetched, ...(RETRACTABLE.has(home) ? { note: "Retractable roof: irrelevant if it's closed (decided on game day)." } : {}) }
 					: { ...base, conditions: "unavailable" };
 			}
 			out.set(home, w);
@@ -105,4 +109,10 @@ export async function gameWeather(games: Row[], now = Date.now()): Promise<Map<s
 		}),
 	);
 	return out;
+}
+
+/** Oldest fetch time among these forecasts (for the as_of block). */
+export function weatherFetchedAt(ws: Iterable<GameWeather>): number | null {
+	const t = [...ws].map((w) => w.fetched_ms).filter((x): x is number => x != null);
+	return t.length ? Math.min(...t) : null;
 }

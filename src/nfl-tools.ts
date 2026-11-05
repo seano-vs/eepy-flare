@@ -3,12 +3,13 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { asOf } from "./asof";
 import { LeagueContext } from "./league";
 import { NflData, expectedPoints, fillPlayedWeeks, leaguePoints, sleeperTeam, unmappedRules } from "./nflverse/stats";
 import { describeInjury, isUnavailable, weeklyStale } from "./nflverse/context";
-import { latestHeadlines, practiceFromNews, roleSignal } from "./news";
+import { latestHeadlines, newsLine, practiceFromNews, roleSignal } from "./news";
 import { rankWaiverTargets } from "./waiver-targets";
-import { gameWeather, type GameWeather } from "./weather";
+import { gameWeather, weatherFetchedAt, type GameWeather } from "./weather";
 import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
 import { poolFetchedAt, weekPool } from "./scoring";
 import { READ_ONLY, fail, fmt, ok } from "./result";
@@ -156,6 +157,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				}
 				const gaps = unmappedRules(scoring);
 				return ok({
+					as_of: await asOf(lc, ["usage", "injury_report", "lines"], { teams: resolved.map((p) => p.team) }),
 					weeks: `${from}-${latest}`,
 					players: out,
 					note:
@@ -314,7 +316,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						proj_week: t.proj_week,
 						...(t.xfp_recent != null ? { xfp_recent: t.xfp_recent } : {}),
 						...(t.role_news ? { role_news: t.role_news.kind === "negative" ? `Warning: ${t.role_news.reason}` : t.role_news.reason } : {}),
-						...(t.news ? { news: `${t.news.title} (${t.news.source}, ${t.news.age_hours}h ago)` } : {}),
+						...(t.news ? { news: newsLine(t.news) } : {}),
 					}));
 				} else {
 					rows.sort((a, b) => val(b) - val(a));
@@ -323,10 +325,11 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					out = top.map((r) => {
 						const h = r.sid ? heads.get(r.sid) : undefined;
 						const sig = h ? roleSignal(h.title) : null;
-						return { ...compact(r), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}), ...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}) };
+						return { ...compact(r), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}), ...(h ? { news: newsLine(h) } : {}) };
 					});
 				}
 				return ok({
+					as_of: await asOf(lc, ["stats", "projections", "news"]),
 					weeks: `${from}-${latest}`,
 					sort: key,
 					players: out,
@@ -390,7 +393,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					"game_status is the final designation (empty until the team's last report of the week). " +
 					(reportRows.some((r) => r.week !== w) ? `report_week marks teams that haven't posted their week ${w} report yet.` : "");
 				if (nflTeam) {
-					return ok({ week: w, team: nflTeam, report: reportRows.map(fmtRow), note });
+					return ok({ as_of: await asOf(lc, ["injury_report"], { teams: [nflTeam] }), week: w, team: nflTeam, report: reportRows.map(fmtRow), note });
 				}
 				const roster = lc.findRoster(q);
 				const mine = new Set(roster.players ?? []);
@@ -409,6 +412,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				const missingSet = new Set(missing);
 				const prac = missing.length ? await practiceFromNews([...mine].filter((id) => missingSet.has(lc.players.get(id)?.team ?? "")), 72) : new Map();
 				return ok({
+					as_of: await asOf(lc, ["injury_report", "injury_tags", ...(prac.size ? (["news"] as const) : [])], { teams: [...mine].map((id) => lc.players.get(id)?.team) }),
 					week: w,
 					team: lc.team(roster.roster_id).owner,
 					report: onReport.map(fmtRow),
@@ -417,7 +421,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						? {
 								not_in_nflverse_yet: {
 									teams: missing,
-									...(prac.size ? { practice_from_news: [...prac].map(([id, p]) => ({ player: fmt(lc.ref(id)), practice: p.practice, ...(p.day ? { day: p.day } : {}), headline: p.title, source: p.source, age_hours: p.age_hours })) } : {}),
+									...(prac.size ? { practice_from_news: [...prac].map(([id, p]) => ({ player: fmt(lc.ref(id)), practice: p.practice, ...(p.day ? { day: p.day } : {}), headline: p.title, source: p.source, ...(p.published_et ? { reported: p.published_et } : {}), age_hours: p.age_hours })) } : {}),
 									note: "nflverse updates a few times a day, so these teams may already have posted. practice_from_news is read from headlines.",
 								},
 							}
@@ -467,6 +471,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					mine = new Map();
 				}
 				return ok({
+					as_of: await asOf(lc, ["lines", "weather"], { weatherAt: weatherFetchedAt(weather.values()) }),
 					week: w,
 					games: games.map((g) => {
 						const home = sleeperTeam(g.home_team)!;
@@ -488,7 +493,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 							...(() => {
 								const wx = weather.get(home);
 								if (!wx || played) return {};
-								const { game: _g, kickoff_et: _k, ...rest } = wx;
+								const { game: _g, kickoff_et: _k, fetched_ms: _f, ...rest } = wx;
 								return { weather: rest };
 							})(),
 						};
@@ -529,7 +534,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						.map((d) => ({ defense: d, ...allowed.get(d)!.get(position) }))
 						.filter((r) => r.rank)
 						.sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99));
-					return ok({ weeks: `${from}-${latest}`, position, defenses: rows, note: "ppg = league-scored points allowed per game to the position; rank 1 = most allowed." });
+					return ok({ as_of: await asOf(lc, ["stats"]), weeks: `${from}-${latest}`, position, defenses: rows, note: "ppg = league-scored points allowed per game to the position; rank 1 = most allowed." });
 				}
 				const rows = defs
 					.map((d) => {
@@ -538,7 +543,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						return { defense: d, QB: cell("QB"), RB: cell("RB"), WR: cell("WR"), TE: cell("TE") };
 					})
 					.sort((a, b) => a.defense.localeCompare(b.defense));
-				return ok({ weeks: `${from}-${latest}`, defenses: rows, note: "Each cell: rank (ppg allowed). Rank 1 = most points allowed to that position = best matchup." });
+				return ok({ as_of: await asOf(lc, ["stats"]), weeks: `${from}-${latest}`, defenses: rows, note: "Each cell: rank (ppg allowed). Rank 1 = most points allowed to that position = best matchup." });
 			} catch (e) {
 				return fail(e);
 			}

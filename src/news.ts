@@ -3,11 +3,14 @@
 // do, so tools surface them next to the numbers. Fail-soft: any error means "no news".
 
 import { sleeper } from "./sleeper";
+import { eastern } from "./waivers";
 
 export interface NewsItem {
 	title: string;
 	source: string;
 	published: string;
+	/** Publish time in Eastern, e.g. "Wed, Nov 4, 9:14 PM ET". */
+	published_et?: string;
 	/** Hours since published, at the time of the request. */
 	age_hours: number;
 	url?: string;
@@ -31,6 +34,7 @@ export function parseNews(data: unknown, now = Date.now()): NewsItem[] {
 			title,
 			source: typeof r.source === "string" ? r.source : "unknown",
 			published: new Date(ms).toISOString(),
+			published_et: eastern(ms),
 			age_hours: Math.max(0, Math.round((now - ms) / 3_600_000)),
 			...(typeof r.metadata?.url === "string" ? { url: r.metadata.url } : {}),
 			...(summary ? { summary: summary.length > 280 ? `${summary.slice(0, 277)}...` : summary } : {}),
@@ -82,6 +86,7 @@ export interface PracticeNews {
 	day?: string;
 	source: string;
 	age_hours: number;
+	published_et?: string;
 	title: string;
 }
 
@@ -115,7 +120,7 @@ export async function practiceFromNews(ids: string[], maxAgeHours = 72): Promise
 			for (const n of await playerNews(id, { limit: 5, maxAgeHours })) {
 				const p = practiceFromText(n.title) ?? (n.summary ? practiceFromText(n.summary) : null);
 				if (p) {
-					out.set(id, { ...p, source: n.source, age_hours: n.age_hours, title: n.title });
+					out.set(id, { ...p, source: n.source, age_hours: n.age_hours, ...(n.published_et ? { published_et: n.published_et } : {}), title: n.title });
 					return;
 				}
 			}
@@ -162,4 +167,15 @@ export function dedupeNews(items: NewsItem[]): NewsItem[] {
 		} else kept.push({ ...n, _key: key, _w: w });
 	}
 	return kept.map(({ _key: _k, _w: _ww, ...n }) => n);
+}
+
+/** One-line headline with source(s) and an absolute time: `Title (rotowire +fantasy_pros, Wed, Nov 4, 9:14 PM ET, 12h ago)`. */
+export function newsLine(n: Pick<NewsItem, "title" | "source" | "age_hours" | "published_et" | "also">): string {
+	const src = [n.source, ...(n.also ?? []).map((a) => `+${a}`)].join(" ");
+	return `${n.title} (${src}, ${n.published_et ? `${n.published_et}, ` : ""}${n.age_hours}h ago)`;
+}
+
+/** Practice status from a headline, with when it was reported. */
+export function practiceLine(p: PracticeNews): string {
+	return `${p.practice}${p.day ? ` ${p.day}` : ""} (${p.source}, ${p.published_et ? `${p.published_et}, ` : ""}${p.age_hours}h ago)`;
 }
