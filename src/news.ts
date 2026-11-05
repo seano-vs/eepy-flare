@@ -74,3 +74,50 @@ export function roleSignal(title: string): RoleSignal | null {
 	for (const [re, reason] of POSITIVE) if (re.test(title)) return { kind: "positive", reason };
 	return null;
 }
+
+export interface PracticeNews {
+	practice: "DNP" | "Limited" | "Full";
+	day?: string;
+	source: string;
+	age_hours: number;
+	title: string;
+}
+
+const PRACTICE_RE: [RegExp, PracticeNews["practice"]][] = [
+	[/\b(did not|didn't|does not|doesn't|won't|will not) practice\b|\bnot practicing\b|\bsits out practice\b|\bmisses practice\b|\babsent from practice\b|\bDNP\b|\bno practice\b/i, "DNP"],
+	[/\blimited\b/i, "Limited"],
+	[/\b(full(y)? (participant|participation|practice|go)|practices? fully|practiced in full|full practice|no limitations)\b/i, "Full"],
+];
+const DAY_RE = /\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/i;
+
+/** Practice participation stated in a headline (or its summary). Pure; exported for tests. */
+export function practiceFromText(text: string): { practice: PracticeNews["practice"]; day?: string } | null {
+	if (!/practic|\bDNP\b|\blimited\b|participa/i.test(text)) return null;
+	// Headlines lead with the latest status ("full practice Thursday after limited Wednesday"),
+	// so the earliest mention wins.
+	let best: { practice: PracticeNews["practice"]; at: number } | null = null;
+	for (const [re, practice] of PRACTICE_RE) {
+		const m = re.exec(text);
+		if (m && (!best || m.index < best.at)) best = { practice, at: m.index };
+	}
+	if (!best) return null;
+	const day = text.slice(best.at).match(DAY_RE)?.[1] ?? text.match(DAY_RE)?.[1];
+	return { practice: best.practice, ...(day ? { day: day.charAt(0).toUpperCase() + day.slice(1).toLowerCase() } : {}) };
+}
+
+/** Latest practice participation per player from the last few days of headlines. */
+export async function practiceFromNews(ids: string[], maxAgeHours = 72): Promise<Map<string, PracticeNews>> {
+	const out = new Map<string, PracticeNews>();
+	await Promise.all(
+		ids.map(async (id) => {
+			for (const n of await playerNews(id, { limit: 5, maxAgeHours })) {
+				const p = practiceFromText(n.title) ?? (n.summary ? practiceFromText(n.summary) : null);
+				if (p) {
+					out.set(id, { ...p, source: n.source, age_hours: n.age_hours, title: n.title });
+					return;
+				}
+			}
+		}),
+	);
+	return out;
+}

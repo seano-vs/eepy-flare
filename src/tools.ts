@@ -19,7 +19,8 @@ import { impliedTotals, injuryReportState, matchups, matchups as matchups_, play
 import { registerNflTools } from "./nfl-tools";
 import { pickSchema, registerAdvisorTools, valuePicks } from "./advisor";
 import { registerLeagueTools } from "./league-tools";
-import { latestHeadlines, playerNews, roleSignal } from "./news";
+import { readPrefs } from "./prefs";
+import { latestHeadlines, playerNews, practiceFromNews, roleSignal, type PracticeNews } from "./news";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { activeIds, computedRecords, loadSeason, recordString, runOdds } from "./playoffs";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
@@ -27,7 +28,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.3.0";
+export const SERVER_VERSION = "1.4.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -233,7 +234,20 @@ export function createServer(env: Env): McpServer {
 				if (reports && w === lc.week) {
 					const myTeams = new Set((r.players ?? []).map((id) => lc.players.get(id)?.team).filter((t): t is string => !!t && !!matchup(t, undefined)));
 					const pending = [...myTeams].filter((t) => !reports.published.has(t)).sort();
-					if (pending.length) out.injury_reports_not_posted = { week: reports.week, teams: pending, note: "No row for these teams' players doesn't mean healthy; their report isn't in yet." };
+					if (pending.length) {
+						// nflverse mirrors reports a few times a day, so a team can have posted already: check headlines.
+						const pendingSet = new Set(pending);
+						const ids = (r.players ?? []).filter((id) => pendingSet.has(lc.players.get(id)?.team ?? ""));
+						const prac = await practiceFromNews(ids, 72).catch(() => new Map<string, PracticeNews>());
+						out.injury_reports_not_in_nflverse = {
+							week: reports.week,
+							teams: pending,
+							...(prac.size
+								? { practice_from_news: Object.fromEntries([...prac].map(([id, p]) => [fmt(lc.ref(id)), `${p.practice}${p.day ? ` ${p.day}` : ""} (${p.source}, ${p.age_hours}h ago)`])) }
+								: {}),
+							note: "These teams' week reports aren't in nflverse yet (it updates a few times a day; the team may already have posted). No row doesn't mean healthy. practice_from_news is read from headlines.",
+						};
+					}
 				}
 				out.fetched_at = new Date().toISOString();
 				const pf = poolFetchedAt.get(`${lc.season}:${w}`);
@@ -294,6 +308,13 @@ export function createServer(env: Env): McpServer {
 				if (!matchups?.length) return ok({ week: w, matchups: [], note: "No matchups for this week." });
 				const pool = poolMap(poolArr);
 				const slots = lc.league.roster_positions.filter((s) => s !== "BN");
+				// Headlines only for starters projected 0 with a game: those notes need a reason.
+				const focusMatch = team === "all" ? undefined : matchups.find((m) => m.roster_id === lc.findRoster(team).roster_id);
+				const detailed = focusMatch ? matchups.filter((m) => m === focusMatch || (focusMatch.matchup_id != null && m.matchup_id === focusMatch.matchup_id)) : [];
+				const zeroIds = pool.size
+					? [...new Set(detailed.flatMap((m) => m.starters ?? []))].filter((id) => id !== "0" && (pool.get(id)?.pts ?? 0) === 0 && !!games(lc.players.get(id)?.team, lc.players.get(id)?.pos))
+					: [];
+				const zeroNews = zeroIds.length ? await latestHeadlines(zeroIds, 72).catch(() => new Map()) : new Map();
 
 				const side = (m: (typeof matchups)[number], detail: boolean) => {
 					const info = lc.team(m.roster_id);
@@ -312,7 +333,7 @@ export function createServer(env: Env): McpServer {
 					base.starters = starters.map((id, i) => {
 						const pl = lc.players.get(id);
 						const proj = pool.size && id !== "0" ? (pool.get(id)?.pts ?? 0) : undefined;
-						const verify = proj != null ? zeroProjectionNote(proj, !!games(pl?.team, pl?.pos), pl?.injury ?? pl?.status, undefined) : undefined;
+						const verify = proj != null ? zeroProjectionNote(proj, !!games(pl?.team, pl?.pos), pl?.injury ?? pl?.status, undefined, zeroNews.get(id)) : undefined;
 						return {
 							slot: slots[i] ?? "?",
 							player: fmt(lc.ref(id)),
@@ -502,23 +523,29 @@ export function createServer(env: Env): McpServer {
 				team: z.string().optional().describe("NFL team abbreviation, e.g. 'DET'. Use 'FA' for free agents."),
 				position: z.enum(["QB", "RB", "WR", "TE", "K", "DEF"]).optional(),
 				available_only: z.boolean().optional().describe("Only players not on a roster in this league."),
+				include_teamless: z.boolean().optional().describe("Include players with no NFL team (unsigned or retired). Default false, unless team is 'FA'; teamless players on a roster here always show."),
 				limit: z.number().int().min(1).max(50).optional().describe("Default 10."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ name, team, position, available_only, limit }) => {
+		async ({ name, team, position, available_only, include_teamless, limit }) => {
 			try {
 				if (!name && !team && !position) return fail("Give at least one of name, team or position.");
 				const lc = await ctx();
 				const owned = lc.ownership();
 				const pool = poolMap(await weekPool(env.PLAYERS, lc.league, lc.season, lc.week, lc.seasonType));
 				const n = limit ?? 10;
-				let hits = lc.players.search({ name, team, position, limit: available_only ? 500 : n });
-				if (available_only) hits = hits.filter((p) => !owned.has(p.id)).slice(0, n);
+				const keepTeamless = include_teamless || team?.toUpperCase() === "FA";
+				let hits = lc.players
+					.search({ name, team, position, limit: 500 })
+					.filter((p) => !available_only || !owned.has(p.id))
+					// Retired and unsigned players clutter results; keep them only on request or when rostered here.
+					.filter((p) => keepTeamless || !!p.team || owned.has(p.id));
+				const hidden = keepTeamless ? 0 : lc.players.search({ name, team, position, limit: 500 }).filter((p) => !p.team && !owned.has(p.id)).length;
+				hits = hits.slice(0, n);
 				// Without a name, rank by this week's projection when we have one.
 				if (!name && pool.size) hits.sort((a, b) => (pool.get(b.id)?.pts ?? -1) - (pool.get(a.id)?.pts ?? -1));
-				return ok(
-					hits.map((p) => ({
+				const rows = hits.map((p) => ({
 						id: p.id,
 						name: p.name,
 						pos: p.pos,
@@ -528,8 +555,8 @@ export function createServer(env: Env): McpServer {
 						...(p.status ? { status: p.status } : {}),
 						league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
 						...(pool.size ? { proj_week: pool.get(p.id)?.pts ?? 0 } : {}),
-					})),
-				);
+					}));
+				return ok(hidden && !rows.length ? { players: rows, teamless_hidden: hidden, note: "Players with no NFL team (unsigned or retired) are hidden; pass include_teamless: true to see them." } : rows);
 			} catch (e) {
 				return fail(e);
 			}
@@ -645,13 +672,16 @@ export function createServer(env: Env): McpServer {
 			inputSchema: z.object({
 				players: z.array(z.string()).min(2).max(8).describe("Names or Sleeper ids."),
 				week: weekArg,
+				focus: z.enum(["win_now", "balanced", "long_term"]).optional().describe("win_now hides dynasty values (default from DEFAULT_TRADE_FOCUS)."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ players, week }) => {
+		async ({ players, week, focus }) => {
 			try {
 				const lc = await ctx();
 				const v = await valuations(lc, players, week, false);
+				const hide = v.dynasty && (focus ?? readPrefs(env, lc.players).focus) === "win_now";
+				if (hide) v.rows = v.rows.map(withoutDynasty);
 				const byWeek = [...v.rows].sort((a, b) => num(b, "week_pts") - num(a, "week_pts"));
 				const byRos = [...v.rows].sort((a, b) => num(b, "ros_vor") - num(a, "ros_vor"));
 				return ok({
@@ -661,7 +691,8 @@ export function createServer(env: Env): McpServer {
 					players: v.rows,
 					best_this_week: byWeek[0]?.player,
 					best_rest_of_season: byRos[0]?.player,
-					...(v.dynasty
+					...(hide ? { dynasty_hidden: DYNASTY_HIDDEN } : {}),
+					...(v.dynasty && !hide
 						? { best_dynasty: [...v.rows].sort((a, b) => num(b, "dynasty_value") - num(a, "dynasty_value"))[0]?.player }
 						: {}),
 					injury_tags_as_of: lc.players.updated,
@@ -686,10 +717,11 @@ export function createServer(env: Env): McpServer {
 				give_picks: z.array(pickSchema).max(6).optional().describe("Draft picks you send."),
 				get_picks: z.array(pickSchema).max(6).optional().describe("Draft picks you receive."),
 				team: z.string().optional().describe("Whose side 'give' is. Default: the configured user ('me')."),
+				focus: z.enum(["win_now", "balanced", "long_term"]).optional().describe("win_now hides dynasty values (default from DEFAULT_TRADE_FOCUS)."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ give: giveIn, get: getIn, give_picks, get_picks, team }) => {
+		async ({ give: giveIn, get: getIn, give_picks, get_picks, team, focus }) => {
 			try {
 				const give = giveIn ?? [];
 				const get = getIn ?? [];
@@ -697,6 +729,9 @@ export function createServer(env: Env): McpServer {
 				if (!get.length && !get_picks?.length) return fail("Nothing received: pass get and/or get_picks.");
 				const lc = await ctx();
 				const v = await valuations(lc, [...give, ...get], undefined, false);
+				const prefs = readPrefs(env, lc.players);
+				// Picks only have dynasty value, so a pick trade always shows it.
+				const hide = v.dynasty && (focus ?? prefs.focus) === "win_now" && !give_picks?.length && !get_picks?.length;
 				const g = v.rows.slice(0, give.length);
 				const r = v.rows.slice(give.length);
 				const sum = (rows: typeof v.rows, k: keyof PlayerValuation | "dynasty_value") => round(rows.reduce((s, x) => s + num(x, k), 0), 1);
@@ -711,6 +746,7 @@ export function createServer(env: Env): McpServer {
 				const warnings: string[] = [];
 				for (const p of givePlayers) {
 					if (owned.get(p.id) !== mine.roster_id) warnings.push(`${p.name} is not on ${lc.team(mine.roster_id).owner}'s roster.`);
+					if (mine.roster_id === lc.myRoster().roster_id && prefs.untouchables.has(p.id)) warnings.push(`${p.name} is on your untouchables list.`);
 				}
 				const partnerIds = new Set(getPlayers.map((p) => owned.get(p.id)).filter((x): x is number => x != null));
 				if (partnerIds.size > 1) warnings.push("Players received come from more than one roster.");
@@ -771,17 +807,18 @@ export function createServer(env: Env): McpServer {
 					from_perspective_of: lc.team(mine.roster_id).owner,
 					...(partner ? { partner: lc.team(partner.roster_id).owner } : {}),
 					weeks: `${v.week}-${v.through_week}`,
-					give: g,
-					get: r,
+					give: hide ? g.map(withoutDynasty) : g,
+					get: hide ? r.map(withoutDynasty) : r,
 					...(givePicks.length ? { give_picks: givePicks.map(({ warning: _w, ...p }) => p) } : {}),
 					...(getPicks.length ? { get_picks: getPicks.map(({ warning: _w, ...p }) => p) } : {}),
 					totals: {
 						give: { ros_pts: sum(g, "ros_pts"), ros_vor: giveVor },
 						get: { ros_pts: sum(r, "ros_pts"), ros_vor: getVor },
 						vor_diff: diff,
-						...(v.dynasty ? { dynasty_value_give: giveDyn, dynasty_value_get: getDyn, dynasty_value_diff: dynDiff } : {}),
+						...(v.dynasty && !hide ? { dynasty_value_give: giveDyn, dynasty_value_get: getDyn, dynasty_value_diff: dynDiff } : {}),
 					},
-					...(v.dynasty ? { verdict: { win_now: verdict, long_term: dynastyVerdict } } : { verdict }),
+					...(v.dynasty && !hide ? { verdict: { win_now: verdict, long_term: dynastyVerdict } } : { verdict }),
+					...(hide ? { dynasty_hidden: DYNASTY_HIDDEN } : {}),
 					...(pool.size
 						? {
 								lineup_this_week: {
@@ -797,7 +834,7 @@ export function createServer(env: Env): McpServer {
 					note:
 						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled: " +
 						"the verdicts are only as good as Sleeper's projections, so check each player's verify list and current news before acting." +
-						(v.dynasty
+						(v.dynasty && !hide
 							? " dynasty_value = market value from Sleeper dynasty ADP (10000 = 1st overall); it is additive, so it overrates trading one star for several depth pieces. " +
 								"A pick is valued as this year's rookie drafted at that overall slot (current dynasty value), minus 10% per extra year out; slot defaults to the original owner's current standing."
 							: ""),
@@ -928,6 +965,14 @@ export function zeroProjectionNote(
 	if (report) return `Projected 0 with a game this week. Official report: ${report}. Confirm he's ruled out before benching or dropping.`;
 	if (tag) return `Projected 0 with a game this week; listed ${tag}. Confirm his status in current news.`;
 	return "Projected 0 with a game this week and no injury or status listed. Sleeper doesn't say why (injury news, benching, depth chart?), so find a dated source before relying on it.";
+}
+
+const DYNASTY_HIDDEN = "Focus is win_now, so dynasty ADP and values are left out. Pass focus: 'balanced' or 'long_term' to include them.";
+
+/** Drop the dynasty market fields from a valuation row. */
+function withoutDynasty<T extends object>(row: T): T {
+	const { dynasty_adp: _a, dynasty_value: _v, ...rest } = row as T & { dynasty_adp?: unknown; dynasty_value?: unknown };
+	return rest as T;
 }
 
 /** Prefer the record computed from matchup results; keep Sleeper's when it differs, so the lag is visible. */

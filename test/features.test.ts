@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { roleFlags } from "../src/nflverse/context";
 import { fillPlayedWeeks } from "../src/nflverse/stats";
-import { parseNews } from "../src/news";
+import { parseNews, practiceFromText } from "../src/news";
 import { playoffByes, simulate, standingsFromMatchups } from "../src/playoffs";
 import { projectionTrackRecord, summarizeWeeks } from "../src/scoring";
 import { zeroProjectionNote } from "../src/tools";
@@ -132,5 +132,14 @@ describe("waiver schedule inference", () => {
 		expect(r.main).toEqual({ weekday: "Wednesday", hour: 7, minute: 6 });
 		expect(r.hourPt).toBe(7);
 		expect(inferSchedule([]).main).toBeNull();
+	});
+});
+
+describe("practiceFromText", () => {
+	it("reads practice participation from headlines", () => {
+		expect(practiceFromText("Jaxon Smith-Njigba (hamstring) did not practice Wednesday")).toEqual({ practice: "DNP", day: "Wednesday" });
+		expect(practiceFromText("Puka Nacua limited at practice on Thursday")).toEqual({ practice: "Limited", day: "Thursday" });
+		expect(practiceFromText("Breece Hall logs full practice Friday after limited Thursday session")).toEqual({ practice: "Full", day: "Friday" });
+		expect(practiceFromText("Josh Allen throws three touchdowns in win")).toBeNull();
 	});
 });

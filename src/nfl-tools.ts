@@ -6,7 +6,7 @@ import { z } from "zod";
 import { LeagueContext } from "./league";
 import { NflData, expectedPoints, fillPlayedWeeks, leaguePoints, sleeperTeam, unmappedRules } from "./nflverse/stats";
 import { describeInjury, isUnavailable, weeklyStale } from "./nflverse/context";
-import { latestHeadlines, roleSignal } from "./news";
+import { latestHeadlines, practiceFromNews, roleSignal } from "./news";
 import { rankWaiverTargets } from "./waiver-targets";
 import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
 import { poolFetchedAt, weekPool } from "./scoring";
@@ -354,6 +354,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				const teamArgs = nflTeam ? [nflTeam === "LAR" ? "LA" : nflTeam] : [];
 				let w: number;
 				let reportRows: Row[];
+				let published: Set<string> | null = null;
 				if (week) {
 					w = week;
 					reportRows = await nfl.weekRange("nfl_injuries", w, w, nflTeam ? "AND team = ?" : "", ...teamArgs);
@@ -361,6 +362,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					const cur = await nfl.currentInjuries(nflTeam ? "AND team = ?" : "", ...teamArgs);
 					w = cur.week;
 					reportRows = cur.rows;
+					published = cur.published;
 				}
 				if (!w) return ok({ note: "No injury reports published for this season yet." });
 				const maps = await nfl.idMaps();
@@ -391,11 +393,27 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					.map((id) => lc.players.get(id))
 					.filter((p) => p?.injury)
 					.map((p) => fmt(p!));
+				// Teams missing from the mirror's current week: read practice status from headlines.
+				const playing = published ? await nfl.opponents(w).catch(() => new Map()) : new Map();
+				const missing = published
+					? [...new Set([...mine].map((id) => lc.players.get(id)?.team).filter((t): t is string => !!t && playing.has(t) && !published!.has(t)))].sort()
+					: [];
+				const missingSet = new Set(missing);
+				const prac = missing.length ? await practiceFromNews([...mine].filter((id) => missingSet.has(lc.players.get(id)?.team ?? "")), 72) : new Map();
 				return ok({
 					week: w,
 					team: lc.team(roster.roster_id).owner,
 					report: onReport.map(fmtRow),
 					...(sleeperOnly.length ? { flagged_by_sleeper_only: sleeperOnly } : {}),
+					...(missing.length
+						? {
+								not_in_nflverse_yet: {
+									teams: missing,
+									...(prac.size ? { practice_from_news: [...prac].map(([id, p]) => ({ player: fmt(lc.ref(id)), practice: p.practice, ...(p.day ? { day: p.day } : {}), headline: p.title, source: p.source, age_hours: p.age_hours })) } : {}),
+									note: "nflverse updates a few times a day, so these teams may already have posted. practice_from_news is read from headlines.",
+								},
+							}
+						: {}),
 					note,
 				});
 			} catch (e) {

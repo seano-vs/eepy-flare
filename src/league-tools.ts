@@ -3,6 +3,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { LeagueContext } from "./league";
+import { isUnavailable } from "./nflverse/context";
 import { playerNews } from "./news";
 import { activeIds, loadSeason, runOdds } from "./playoffs";
 import { READ_ONLY, fail, fmt, ok } from "./result";
@@ -81,11 +82,37 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 					return xs[Math.floor(xs.length / 2)] ?? 0;
 				});
 
+				// Free agents who'd start somewhere this week (unowned, not out), best first.
+				const owned = lc.ownership();
+				const freeAgents = pools[0]
+					? [...pools[0].entries()]
+							.filter(([id, e]) => e.pts > 0 && !owned.has(id) && !isUnavailable(lc.players.get(id)))
+							.sort((a, b) => b[1].pts - a[1].pts)
+							.slice(0, 40)
+							.map(([id]) => id)
+					: [];
+
 				const target = team ? lc.findRoster(team) : undefined;
 				const out = lc.rosters
 					.filter((r) => !target || r.roster_id === target.roster_id)
 					.map((r) => {
 						const lineup = lineups.get(r.roster_id);
+						// The two starting slots furthest below the league median.
+						const gaps = (lineup?.starters ?? [])
+							.map((s, i) => ({ slot: s.slot, starter: s.id ? fmt(lc.ref(s.id)) : "(empty)", proj: s.pts, league_median: round(medianAt[i]!, 1), gap: round(medianAt[i]! - s.pts, 1) }))
+							.filter((g) => g.gap > 0)
+							.sort((a, b) => b.gap - a.gap)
+							.slice(0, 2);
+						// Best free-agent adds: biggest gain to this week's best lineup.
+						const base = lineup?.total ?? 0;
+						const adds = pools[0]
+							? freeAgents
+									.map((id) => ({ id, gain: round(optimalLineup([...activeIds(r), id], slots, pools[0]!).total - base, 1) }))
+									.filter((a) => a.gain >= 1)
+									.sort((a, b) => b.gain - a.gain)
+									.slice(0, 2)
+									.map((a) => ({ player: fmt(lc.ref(a.id)), lineup_gain: a.gain }))
+							: [];
 						const weak = (lineup?.starters ?? [])
 							.map((s, i) => ({ s, i }))
 							.filter(({ s, i }) => medianAt[i]! > 0 && s.pts < 0.8 * medianAt[i]!)
@@ -113,8 +140,11 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 						const st = season.standings.get(r.roster_id);
 						return {
 							team: lc.team(r.roster_id).owner,
+							...(lc.team(r.roster_id).team_name ? { team_name: lc.team(r.roster_id).team_name } : {}),
 							...(st ? { record: `${st.wins}-${st.losses}${st.ties ? `-${st.ties}` : ""}` } : {}),
 							faab_left: budget - (r.settings.waiver_budget_used ?? 0),
+							...(gaps.length ? { top_gaps: gaps } : {}),
+							...(adds.length ? { best_free_agent_adds: adds } : {}),
 							...(weak.length ? { weak_slots: weak } : {}),
 							...(holes.length ? { lineup_holes: holes } : {}),
 							qb_coverage: { slots: qbSlots, by_week: qbs, ...(qbs.some((q) => q.qbs_playing < qbSlots) ? { short: true } : {}) },
@@ -124,7 +154,9 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 				return ok({
 					weeks: season.weeks.slice(0, 2).join(", "),
 					teams: out,
-					note: "weak_slots: this week's best projected starter is below 80% of the league median at that slot. Projections are Sleeper's; check news for the players involved.",
+					note:
+						"top_gaps: the two starting slots furthest below the league median this week. best_free_agent_adds: unowned, available players who'd add the most to that team's best lineup this week (on-waivers status not checked). " +
+						"weak_slots: this week's best projected starter is below 80% of the league median at that slot. Projections are Sleeper's; check news for the players involved.",
 				});
 			} catch (e) {
 				return fail(e);

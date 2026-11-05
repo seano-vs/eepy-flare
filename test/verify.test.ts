@@ -73,13 +73,16 @@ describe("verifyNotes", () => {
 
 	it("flags a return projected with no injury or status listed", () => {
 		const notes = verifyNotes({ ...base, playedWeeks: [8, 9, 10], outWeeks: [7], seasonGames: 0 });
-		expect(notes).toHaveLength(2);
-		expect(notes[1]).toContain("return in week 8.");
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toContain("no injury or status listed");
+		expect(notes[0]).toContain("return in week 8:");
 	});
 
-	it("flags a game-time designation projected for zero", () => {
+	it("flags a game-time designation projected for zero, in one note", () => {
 		const notes = verifyNotes({ ...base, injury: "Questionable", playedWeeks: [8, 9], outWeeks: [7] });
-		expect(notes.some((n) => n.startsWith("Listed Questionable but projected for no game this week"))).toBe(true);
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toMatch(/^Listed Questionable but projected for no game this week/);
+		expect(notes[0]).toContain("return in week 8 (listed Questionable)");
 	});
 
 	it("flags an Out player who is still projected to play", () => {

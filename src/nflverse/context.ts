@@ -209,7 +209,7 @@ export async function playerContext(
 			if (inj) {
 				const text = describeInjury(inj);
 				// Teams post on different days: say when this is last week's report.
-				if (text) ctx.injury_report = Number(inj.week) === injuries.week ? text : `${text} [week ${inj.week} report; week ${injuries.week} not posted yet]`;
+				if (text) ctx.injury_report = Number(inj.week) === injuries.week ? text : `${text} [week ${inj.week} report; week ${injuries.week} not in nflverse yet]`;
 			}
 			if (ctx.recent || ctx.ecr || ctx.injury_report || ctx.role_change) out.set(sid, ctx);
 		}

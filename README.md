@@ -215,7 +215,19 @@ Since 1.2:
   bubble (20–60%) or rebuilding (<20%), and how much lineup loss they'll accept depends on it.
 - **Preferences.** `UNTOUCHABLES` (comma-separated names) are never offered in trades or suggested
   as drops; `DEFAULT_TRADE_FOCUS` (`win_now`, `balanced` or `long_term`) is the default `focus`.
-  Both are vars in `wrangler.jsonc`, so every client and scheduled scan gets them.
+  Both are vars in `wrangler.jsonc`, so every client and scheduled scan gets them. With win_now,
+  `compare_players` and `evaluate_trade` leave out dynasty ADP and values (pass `focus` to see
+  them; trades with picks always show them), and giving an untouchable adds a warning.
+- **Injury reports.** nflverse mirrors the official report a few times a day, so a team missing
+  from it may already have posted: `get_my_roster` (`injury_reports_not_in_nflverse`) and
+  `get_injury_report` (`not_in_nflverse_yet`) name those teams and add practice participation
+  (DNP / Limited / Full, with the day) read from the last 3 days of headlines.
+- **Team needs.** `get_team_needs` gives each team's two biggest gaps vs the league median at a
+  starting slot, the two free agents who'd add most to its lineup this week, and its team name.
+- **Search.** `search_players` hides players with no NFL team (unsigned or retired) unless
+  they're on a roster here, `team` is `FA`, or `include_teamless` is set.
+- **Verify notes.** Each projected absence gets one note: why it's suspect, plus the projected
+  return week. `get_matchup` quotes a fresh headline for a starter projected 0.
 - **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
   that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
   from the original owner's standing (worst record picks first). `traded_picks` determines who owns

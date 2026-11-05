@@ -56,26 +56,21 @@ export function verifyNotes(i: VerifyInput): string[] {
 	const outNow = i.outWeeks.includes(i.week);
 	const playsNow = i.playedWeeks.includes(i.week);
 
-	if (i.outWeeks.length && !tag) {
-		notes.push(
-			`Projected for no game in ${formatWeeks(i.outWeeks)}, with no injury or status listed. ` +
-				"Sleeper doesn't say why (benching, suspension, depth chart?), so find a dated source before relying on it.",
-		);
-	}
-
-	const back = i.outWeeks.length ? i.playedWeeks.find((w) => w > i.outWeeks[0]!) : undefined;
-	if (outNow && back != null) {
-		notes.push(
-			`Projected to return in week ${back}${tag ? ` (listed ${tag})` : ""}. ` +
-				"Treat that as the earliest case and check the official timeline.",
-		);
-	}
-
-	if (tag && GAME_TIME.has(tag) && outNow) {
-		notes.push(
-			`Listed ${tag} but projected for no game this week, so Sleeper may be assuming he sits. ` +
-				"Check the final injury report and inactives.",
-		);
+	// One note per absence: what's missing, why it's suspicious, and the projected return.
+	if (i.outWeeks.length) {
+		const back = i.playedWeeks.find((w) => w > i.outWeeks[0]!);
+		const returns = outNow && back != null ? ` Projected to return in week ${back}${tag ? ` (listed ${tag})` : ""}: treat that as the earliest case and check the official timeline.` : "";
+		if (!tag) {
+			notes.push(
+				`Projected for no game in ${formatWeeks(i.outWeeks)}, with no injury or status listed. ` +
+					"Sleeper doesn't say why (benching, suspension, depth chart?), so find a dated source before relying on it." +
+					returns,
+			);
+		} else if (GAME_TIME.has(tag) && outNow) {
+			notes.push(`Listed ${tag} but projected for no game this week, so Sleeper may be assuming he sits. Check the final injury report and inactives.${returns}`);
+		} else if (returns) {
+			notes.push(returns.trim());
+		}
 	}
 	if (tag && NOT_PLAYING.has(tag) && playsNow) {
 		notes.push(`Listed ${tag} but still projected to play this week. The projection may be stale.`);
