@@ -64,3 +64,13 @@ describe("summaries", () => {
 		expect(s).toEqual({ pass_td: 6, pass_yd: "0.04 (1 pt / 25 yds)", rec: 1 });
 	});
 });
+
+describe("readPrefs", () => {
+	it("resolves untouchables, ignores unknown names and defaults focus", async () => {
+		const { readPrefs } = await import("../src/prefs");
+		const p = readPrefs({ UNTOUCHABLES: "Amon-Ra St. Brown, Nobody Atall", DEFAULT_TRADE_FOCUS: "win_now" } as unknown as Env, db);
+		expect([...p.untouchables]).toEqual(["5000"]);
+		expect(p.focus).toBe("win_now");
+		expect(readPrefs({} as unknown as Env, db).focus).toBe("balanced");
+	});
+});

@@ -19,7 +19,7 @@ import { impliedTotals, injuryReportState, matchups, matchups as matchups_, play
 import { registerNflTools } from "./nfl-tools";
 import { pickSchema, registerAdvisorTools, valuePicks } from "./advisor";
 import { registerLeagueTools } from "./league-tools";
-import { latestHeadlines, playerNews } from "./news";
+import { latestHeadlines, playerNews, roleSignal } from "./news";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { activeIds, computedRecords, loadSeason, recordString, runOdds } from "./playoffs";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
@@ -27,7 +27,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.2.0";
+export const SERVER_VERSION = "1.3.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -458,9 +458,10 @@ export function createServer(env: Env): McpServer {
 						.filter(({ p }) => p && (!position || p.pos === position) && ["QB", "RB", "WR", "TE"].includes(p.pos))
 						.slice(0, limit ?? 25);
 					// Recent usage separates a real role change from a one-week blip.
-					const [nflCtx, waivers] = await Promise.all([
+					const [nflCtx, waivers, heads] = await Promise.all([
 						playerContext(lc, picked.map(({ t }) => t.player_id), { projections: new Map(picked.map(({ t }) => [t.player_id, pool.get(t.player_id)?.pts ?? null])) }),
 						k === "add" ? waiverStatuses(lc, picked.map(({ t }) => t.player_id)) : Promise.resolve(new Map()),
+						latestHeadlines(picked.map(({ t }) => t.player_id), 96),
 					]);
 					out[k === "add" ? "adds" : "drops"] = picked.map(({ t, p }) => {
 						const c = nflCtx.get(t.player_id);
@@ -471,6 +472,11 @@ export function createServer(env: Env): McpServer {
 							...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
 							...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 							...(c?.role_change ? { role_change: c.role_change } : {}),
+							...(() => {
+								const h = heads.get(t.player_id);
+								const sig = h ? roleSignal(h.title) : null;
+								return { ...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}) };
+							})(),
 							...(waivers.get(t.player_id) ? { waiver: waivers.get(t.player_id) } : {}),
 							...(!onlyAvail && owned.has(t.player_id) ? { rostered_by: lc.team(owned.get(t.player_id)!).owner } : {}),
 						};

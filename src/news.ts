@@ -53,3 +53,24 @@ export async function latestHeadlines(ids: string[], maxAgeHours = 72): Promise<
 	for (const [id, n] of results) if (n) out.set(id, n);
 	return out;
 }
+
+export type RoleSignal = { kind: "negative" | "positive"; reason: string };
+
+const NEGATIVE: [RegExp, string][] = [
+	[/\b(benched|demoted|to the bench|loses? (the |his )?(starting )?(job|role|spot)|no longer (the )?starter)\b/i, "benched or demoted"],
+	[/\b(no\. ?3|third[- ]string|qb3|backup role|relegated)\b/i, "backup role"],
+	[/\b(traded|dealt)\b/i, "traded (role on new team unclear)"],
+	[/\b(released|waived|cut by|let go)\b/i, "released"],
+	[/\b(placed on (ir|injured reserve)|season[- ]ending|out for (the )?(season|year)|suspended)\b/i, "out long-term"],
+	[/\b(ruled out|won'?t play|will not play|inactive)\b/i, "ruled out"],
+];
+const POSITIVE: [RegExp, string][] = [
+	[/\b(named (the )?(starter|starting)|will start|to start|set to start|in line to start|expected to start|could start|takes over|promoted|first[- ]team|lead (back|role)|starting role)\b/i, "in line to start"],
+];
+
+/** Classify a headline as role news (pure; exported for tests). Negative checks win when both match. */
+export function roleSignal(title: string): RoleSignal | null {
+	for (const [re, reason] of NEGATIVE) if (re.test(title)) return { kind: "negative", reason };
+	for (const [re, reason] of POSITIVE) if (re.test(title)) return { kind: "positive", reason };
+	return null;
+}

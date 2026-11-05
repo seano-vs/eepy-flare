@@ -64,3 +64,15 @@ describe("points allowed by position", () => {
 		expect(pa.get("LAR")!.get("WR")).toEqual({ ppg: 20, games: 1, rank: 1 });
 	});
 });
+
+describe("value-based bids", () => {
+	it("prices at lineup gain x weeks x rate, capped by the reserve", async () => {
+		const { valueBid, reserveFor } = await import("../src/advisor");
+		expect(valueBid(4, 5, 0.5, 100, 20)).toBe(10);
+		expect(valueBid(10, 10, 2, 100, 20)).toBe(80);
+		expect(valueBid(-3, 5, 0.5, 100, 20)).toBe(0);
+		expect(reserveFor(100, 10)).toBe(40);
+		expect(reserveFor(100, 3)).toBe(15);
+		expect(reserveFor(100, 0)).toBe(10);
+	});
+});

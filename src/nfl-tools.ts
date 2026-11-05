@@ -6,6 +6,8 @@ import { z } from "zod";
 import { LeagueContext } from "./league";
 import { NflData, expectedPoints, fillPlayedWeeks, leaguePoints, sleeperTeam, unmappedRules } from "./nflverse/stats";
 import { describeInjury, isUnavailable, weeklyStale } from "./nflverse/context";
+import { latestHeadlines, roleSignal } from "./news";
+import { rankWaiverTargets } from "./waiver-targets";
 import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
 import { poolFetchedAt, weekPool } from "./scoring";
 import { READ_ONLY, fail, fmt, ok } from "./result";
@@ -20,7 +22,7 @@ const num = (r: Row | undefined, k: string): number => {
 const avg = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
 const pct = (x: number) => round(x * 100, 1);
 
-const SORTS = ["xfp", "buy_low", "sell_high", "targets", "target_share", "wopr", "carries", "snap_pct", "air_yards", "red_zone", "points"] as const;
+const SORTS = ["waiver", "xfp", "buy_low", "sell_high", "targets", "target_share", "wopr", "carries", "snap_pct", "air_yards", "red_zone", "points"] as const;
 
 export function registerNflTools(server: McpServer, env: Env): void {
 	const load = async () => {
@@ -172,7 +174,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 			inputSchema: z.object({
 				position: z.enum(["QB", "RB", "WR", "TE"]).optional(),
 				weeks: z.number().int().min(1).max(18).optional().describe("Recent weeks to aggregate (default 3)."),
-				sort: z.enum(SORTS).optional().describe("Default xfp (expected points per game)."),
+				sort: z.enum(SORTS).optional().describe("Default: waiver with available_only (projection + expected points + news), else xfp."),
 				available_only: z.boolean().optional().describe("Only players not on a roster in this league."),
 				include_injured: z.boolean().optional().describe("With available_only, keep players listed Out/Doubtful/IR/suspended (default false)."),
 				limit: z.number().int().min(1).max(50).optional().describe("Default 15."),
@@ -269,7 +271,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						rows = rows.filter((r) => !isUnavailable(r.sid ? lc.players.get(r.sid) : undefined, r.sid ? report.get(r.sid) : undefined));
 					}
 				}
-				const key = sort ?? "xfp";
+				const key = sort ?? (available_only ? "waiver" : "xfp");
 				const val = (r: (typeof rows)[number]): number => {
 					const x = r as unknown as Row;
 					switch (key) {
@@ -288,16 +290,41 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					}
 				};
 				if (key === "buy_low" || key === "sell_high") rows = rows.filter((r) => "xfp" in r && (r.xfp ?? 0) >= 6);
-				rows.sort((a, b) => val(b) - val(a));
-				const compact = ({ sid: _sid, ...r }: (typeof rows)[number]) =>
+				const compact = ({ sid: _sid, ...r }: (typeof rows)[number] | Row) =>
 					Object.fromEntries(
 						Object.entries(r).filter(([k, v]) => !(v === 0 && ["targets", "tgt_share", "wopr", "carries", "air_yards"].includes(k))),
 					);
+				const n = limit ?? 15;
+				let out: Row[];
+				if (key === "waiver") {
+					// This week's projection + recent expected points, re-ranked by headlines; includes
+					// players with little usage yet (a newly named starter) that a usage sort would miss.
+					const ranked = await rankWaiverTargets(lc, { position, includeInjured: include_injured, limit: n });
+					const byId = new Map(rows.map((r) => [r.sid, r]));
+					out = ranked.targets.map((t) => ({
+						...(byId.get(t.id) ? compact(byId.get(t.id)!) : { player: fmt(lc.ref(t.id)), league_status: "available", note: "under 2 games of usage in the window" }),
+						proj_week: t.proj_week,
+						...(t.xfp_recent != null ? { xfp_recent: t.xfp_recent } : {}),
+						...(t.role_news ? { role_news: t.role_news.kind === "negative" ? `Warning: ${t.role_news.reason}` : t.role_news.reason } : {}),
+						...(t.news ? { news: `${t.news.title} (${t.news.source}, ${t.news.age_hours}h ago)` } : {}),
+					}));
+				} else {
+					rows.sort((a, b) => val(b) - val(a));
+					const top = rows.slice(0, n);
+					const heads = available_only ? await latestHeadlines(top.map((r) => r.sid).filter((x): x is string => !!x), 96) : new Map();
+					out = top.map((r) => {
+						const h = r.sid ? heads.get(r.sid) : undefined;
+						const sig = h ? roleSignal(h.title) : null;
+						return { ...compact(r), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}), ...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}) };
+					});
+				}
 				return ok({
 					weeks: `${from}-${latest}`,
 					sort: key,
-					players: rows.slice(0, limit ?? 15).map(compact),
-					note: "Per-game averages. pts/xfp use this league's scoring; diff = pts - xfp. rz_opps = red-zone targets + carries. buy_low/sell_high only consider players with 6+ xfp per game.",
+					players: out,
+					note:
+						"Per-game averages. pts/xfp use this league's scoring; diff = pts - xfp. rz_opps = red-zone targets + carries. buy_low/sell_high only consider players with 6+ xfp per game. " +
+						"sort=waiver (default with available_only) blends this week's Sleeper projection with recent expected points and re-ranks by the latest headline; check role_news before adding anyone.",
 				});
 			} catch (e) {
 				return fail(e);

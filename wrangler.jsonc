@@ -38,6 +38,13 @@
     // secrets GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and COOKIE_ENCRYPTION_KEY.
     "AUTH_MODE": "github",
     // GitHub logins and/or numeric user ids allowed to sign in (phase 2). Empty = nobody.
-    "ALLOWED_GITHUB_USERS": "seano-vs,64788907"
+    "ALLOWED_GITHUB_USERS": "seano-vs,64788907",
+
+    // League preferences applied by every tool (see src/prefs.ts).
+    // Players never offered in trades or suggested as drops (comma-separated names).
+    "UNTOUCHABLES": "Amon-Ra St. Brown",
+    // win_now | balanced | long_term: default focus for find_trades and evaluate_trade.
+    // win_now also hides dynasty fields unless a tool is asked for them.
+    "DEFAULT_TRADE_FOCUS": "win_now"
   }
 }

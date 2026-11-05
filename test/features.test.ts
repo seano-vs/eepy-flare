@@ -121,11 +121,16 @@ describe("standings and playoff simulation", () => {
 });
 
 describe("waiver schedule inference", () => {
-	it("finds the usual processing hour and days", () => {
+	it("reads the main run in Pacific time, so DST doesn't shift it", () => {
 		const t = (iso: string) => Date.parse(iso);
-		const r = inferSchedule([t("2026-11-04T14:01:00Z"), t("2026-11-05T14:00:00Z"), t("2026-10-28T14:02:00Z"), t("2026-10-30T15:00:00Z")]);
-		expect(r.hour).toBe("14:00 UTC");
-		expect(r.days[0]).toBe("Wednesday");
-		expect(inferSchedule([]).hour).toBeNull();
+		// 7:06 AM PT is 14:06 UTC before DST ends and 15:06 UTC after.
+		const r = inferSchedule([
+			{ at: t("2026-10-28T14:06:00Z"), claims: 6 }, // Wed, PDT
+			{ at: t("2026-11-04T15:06:00Z"), claims: 7 }, // Wed, PST
+			{ at: t("2026-10-30T14:25:00Z"), claims: 1 }, // Fri per-player clear
+		]);
+		expect(r.main).toEqual({ weekday: "Wednesday", hour: 7, minute: 6 });
+		expect(r.hourPt).toBe(7);
+		expect(inferSchedule([]).main).toBeNull();
 	});
 });

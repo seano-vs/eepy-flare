@@ -149,7 +149,9 @@ export async function playerContext(
 			latest ? nfl.forPlayers("nfl_pbp_week", "gsis_id", gsis, from, latest) : [],
 			latest ? nfl.forPlayers("nfl_snaps", "pfr_id", pfr, 1, latest) : [],
 			nfl.ecr(fp),
-			gsis.length ? nfl.currentInjuries(`AND gsis_id IN (${gsis.map(() => "?").join(",")})`, ...gsis) : { week: 0, rows: [] as Row[], published: new Set<string>() },
+			// The whole current report (a few hundred rows), filtered below: an IN list over many players
+			// would pass D1's 100 bound-parameter limit.
+			gsis.length ? nfl.currentInjuries() : { week: 0, rows: [] as Row[], published: new Set<string>() },
 		]);
 		const group = (rows: Row[], col: string) => {
 			const m = new Map<string, Row[]>();
@@ -164,7 +166,8 @@ export async function playerContext(
 		const pbpBy = group(pbp, "gsis_id");
 		const snapsBy = group(snaps, "pfr_id");
 		const ecrBy = group(ecr, "fantasypros_id");
-		const injBy = new Map(injuries.rows.map((r) => [String(r.gsis_id), r]));
+		const wanted = new Set(gsis);
+		const injBy = new Map(injuries.rows.filter((r) => wanted.has(String(r.gsis_id))).map((r) => [String(r.gsis_id), r]));
 		const scoring = lc.league.scoring_settings;
 
 		for (const [sid, id] of ids) {

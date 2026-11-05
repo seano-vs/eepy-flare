@@ -175,9 +175,11 @@ Since 1.2:
   sd = max(18, 17% of the mean), 5,000 runs with a fixed seed, seeded by wins then points for.
   `evaluate_trade` re-runs this with both rosters swapped and shows playoff odds before and after.
 - **Waivers.** `get_league_settings` adds `waiver_schedule`, built from when this league's claims
-  actually completed. In this league that's daily around 14:00 UTC, with 2 clear days.
-  `get_faab_advice` and trending adds mark each player as `on waivers` (dropped within the clear
-  window, with who dropped him and when he clears) or `free agent` (add now, no bid).
+  actually completed. Times are read in Pacific (Sleeper's `daily_waivers_hour` is Pacific, so
+  UTC drifts with daylight saving) and shown in Eastern: `main_run` is the run that processes the
+  most claims (here "Wednesday ~10:06 AM ET"). `get_faab_advice` and trending adds mark each player
+  as `on waivers` (dropped within the clear window, with who dropped him and when he clears, in ET)
+  or `free agent` (add now, no bid).
 - **Byes.** Byes come from the NFL schedule, so a week when the team plays but Sleeper projects the
   player for nothing is `projected_out`, not a bye.
 - **Freshness.** `get_nfl_data_status` also reports the players-cache, projection and ADP fetch
@@ -190,12 +192,30 @@ Since 1.2:
   same-position claims by expected points: low, likely and aggressive at the 25th, 50th and 75th
   percentile, with aggressive also clearing the best losing bid seen. With fewer than two close
   comparables, it places the player within the position's whole claim history instead. Without a
-  player, it ranks the best available targets, skipping anyone out or on IR.
+  player, it ranks the best available targets, skipping anyone out or on IR. Targets are ranked
+  on a 50/50 blend of this week's projection and recent expected points, then re-ranked by
+  headlines from the last 4 days: a benching or demotion cuts the score to 35%, a promotion raises
+  it to the higher of the two.
+- **What he's worth to you.** Next to the market range, each target gets `value_to_you`:
+  `your_max` = his average weekly gain to your best lineup (next 4 weeks) × weeks counted
+  (regular-season weeks left + playoff weeks × your playoff odds) × the league's going rate
+  (median winning bid per expected point over replacement per remaining week), capped at your
+  remaining budget minus a reserve (5% per week left, 10–40%). Bids are also shown as a share of
+  your remaining budget, with a warning above 20%. `likely_rival_bidders` lists teams that can
+  afford the likely bid and would start him. With a full roster, `suggested_drop` is the player
+  whose loss costs your lineup least, never an untouchable. If the market pays more than
+  `your_max`, let it.
 - **Trade finder.** Player value is the average of the next 3 weeks' Sleeper projections under
   league scoring, so byes and current roles count. For every other roster it tries each 1-for-1
-  and 2-for-1 swap, recomputes both teams' best starting lineups, and keeps trades that improve
-  yours, cost theirs at most a point a week, and are within 20% on value. In dynasty leagues,
-  value blends rest-of-season VOR with dynasty market value according to `focus`.
+  and 2-for-1 swap, recomputes both teams' best starting lineups week by week, and keeps trades
+  that improve yours, cost theirs at most a point a week, and are within 20% on value. In dynasty
+  leagues, value blends rest-of-season VOR with dynasty market value according to `focus`.
+  Projections for players flagged as taking a bigger role are discounted toward their recent
+  expected points until the usage shows up. Partners are labeled contending (>60% playoff odds),
+  bubble (20–60%) or rebuilding (<20%), and how much lineup loss they'll accept depends on it.
+- **Preferences.** `UNTOUCHABLES` (comma-separated names) are never offered in trades or suggested
+  as drops; `DEFAULT_TRADE_FOCUS` (`win_now`, `balanced` or `long_term`) is the default `focus`.
+  Both are vars in `wrangler.jsonc`, so every client and scheduled scan gets them.
 - **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
   that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
   from the original owner's standing (worst record picks first). `traded_picks` determines who owns
@@ -377,112 +397,6 @@ auth flow:
 The GitHub token is used once to read your login and is never stored. CSRF protection, browser-bound
 one-time `state`, frame blocking and escaping on the consent page all come from the library's
 consent and upstream helpers.
-
-#### nflverse data (D1)
-
-nflreadpy downloads [nflverse](https://github.com/nflverse/nflverse-data) CSV and parquet files and
-caches them on disk. Here the same files are mirrored into **D1** (Cloudflare's SQLite database),
-reduced to fantasy-relevant columns and QB/RB/WR/TE:
-
-| Table | Source | Upstream refresh |
-| --- | --- | --- |
-| `nfl_player_week` | `stats_player_week_{season}`: box scores, target share, air-yards share, WOPR, EPA | nightly after game days |
-| `nfl_snaps` | `snap_counts_{season}` (PFR) | 4× a day |
-| `nfl_injuries` | `injuries_{season}`: game status and practice participation | daily 07:00 UTC |
-| `nfl_opportunity` | [ffopportunity](https://github.com/ffverse/ffopportunity) `ep_weekly_{season}`: expected stats | nightly |
-| `nfl_games` | `schedules/games`: kickoff, scores, spread, total, moneylines | every 5 min |
-| `nfl_pbp_week` | derived from `play_by_play_{season}.parquet`: red-zone targets/carries and team shares, end-zone and deep (20+ air yards) targets, carries inside the 10 and 5 | nightly after game days |
-| `nfl_ngs_receiving` / `_rushing` / `_passing` | NFL Next Gen Stats, weekly: separation, cushion, aDOT, YAC over expected; rush yards over expected, 8-man boxes; CPOE, time to throw, aggressiveness | nightly |
-| `nfl_ecr` | FantasyPros consensus rankings via DynastyProcess `db_fpecr_latest`: weekly superflex and positional, rest-of-season positional, dynasty superflex | weekly |
-| `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ↔ FantasyPros ids | daily |
-
-- **Failures.** A dataset that fails to sync (after one retry on a 5xx) keeps its last good data.
-  The error is stored in `nfl_sync_errors` and reported by `get_nfl_data_status` until a sync
-  succeeds.
-- **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
-  unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
-  column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
-  changed are rewritten. Stat corrections (by Wednesday night) touch a week or two, so a normal
-  update writes a few hundred rows, well inside D1's free 100,000 writes a day. The first sync
-  writes about 17,000 rows.
-- **Play-by-play.** The season's play-by-play is about 9 MB of Snappy-compressed Parquet with 372
-  columns. [`hyparquet`](https://github.com/hyparam/hyparquet) (pure JS) reads just the 10 columns
-  needed, and the plays are aggregated into one row per player-week before anything is stored. Raw
-  plays aren't kept: the tools only need the aggregates, and a season of plays would be 50,000 rows
-  of mostly unused columns. For ad-hoc SQL over full play-by-play history, the Parquet files could
-  be registered as Iceberg tables in R2 and queried with Basin SQL, but that's analytics, not
-  something a tool call should wait seconds for.
-- **Existing tools use this data.** `get_my_roster`, `project_player`, `compare_players`,
-  `evaluate_trade` and `get_trending_players` add FantasyPros consensus ranks, recent usage (snap %,
-  targets, red-zone looks, points and expected points over the last 3 weeks) and the official injury
-  report. `get_my_roster` also shows each player's team implied total. If D1 isn't configured or
-  hasn't synced, these fields are simply left out.
-- **Rankings freshness.** FantasyPros weekly ranks are hidden once a new NFL week has started
-  (Tuesday) until the next scrape. Otherwise last week's ranks would read as this week's.
-  Rest-of-season and dynasty ranks are always shown, with their date.
-- **Schema.** Tables are created by the first sync, so no migrations need to run in the build.
-  Changing a table definition bumps `SCHEMA_VERSION` in `src/nflverse/sync.ts`, and the next sync
-  drops and rebuilds everything from upstream.
-- **League scoring.** `pts` applies your league's `scoring_settings` to the nflverse box score.
-  For week 8 it matched Sleeper's official points for 136 of 137 rostered players; the one
-  difference was a stat Sleeper had and nflverse didn't. `xfp` re-scores ffopportunity's expected
-  yards, receptions, touchdowns and two-pointers with the same rules, so it reflects 6-point passing
-  TDs and any TE premium. Yardage-bucket bonuses can't be reproduced and are listed in the tool output.
-- **IDs.** nflverse uses GSIS and PFR ids. The DynastyProcess map links about 99% of fantasy-relevant
-  players to Sleeper ids. Unmapped players still appear in rankings under their nflverse name.
-- **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
-  nflverse (nflverse.com), ffverse, and DynastyProcess. Next Gen Stats come from the NFL and
-  rankings from FantasyPros, both as republished by those projects.
-
-### Advisors
-
-Since 1.2:
-
-- **News.** Sleeper's own per-player news feed (undocumented; the RotoWire, RotoBaller and
-  FantasyPros blurbs the app shows). `get_my_roster` adds each player's latest headline from the
-  last 72 hours, and the valuation tools add up to two from the last week. A 0 projection with
-  fresh news quotes the headline.
-- **Role changes.** Each player's last 3 weeks are compared with the rest of his season: snap share
-  (±15 points), target share, carries and expected points (each ±30% and a minimum size). The
-  check also flags when Sleeper's projection for this week is far from what recent usage supports.
-  These show up as `role_change` on roster, valuation and trending output.
-- **Projection track record.** `project_player`, `compare_players` and `evaluate_trade` show how
-  Sleeper's weekly projections compared with the player's actual points in games played so far:
-  average projected vs actual, bias % and average miss.
-- **Playoff odds.** Records come from matchup results, which can be ahead of Sleeper's displayed
-  record (`sleeper_record` appears when they differ). For each remaining regular-season week, a
-  team's mean is its best projected lineup that week, where byes and projected absences count,
-  blended 75/25 with its actual points per game. Scores are drawn from a normal distribution with
-  sd = max(18, 17% of the mean), 5,000 runs with a fixed seed, seeded by wins then points for.
-  `evaluate_trade` re-runs this with both rosters swapped and shows playoff odds before and after.
-- **Waivers.** `get_league_settings` adds `waiver_schedule`, built from when this league's claims
-  actually completed. In this league that's daily around 14:00 UTC, with 2 clear days.
-  `get_faab_advice` and trending adds mark each player as `on waivers` (dropped within the clear
-  window, with who dropped him and when he clears) or `free agent` (add now, no bid).
-- **Byes.** Byes come from the NFL schedule, so a week when the team plays but Sleeper projects the
-  player for nothing is `projected_out`, not a bye.
-- **Freshness.** `get_nfl_data_status` also reports the players-cache, projection and ADP fetch
-  times, the FantasyPros rankings date, and which teams haven't posted this week's injury report.
-  `get_my_roster` lists those teams for your players and stamps `fetched_at`.
-
-- **FAAB bids.** Every waiver claim in the league is read from Sleeper's transactions, including
-  losing bids. For each claimed player, the server computes expected points per game (league
-  scoring) over the 3 weeks before the claim. A target's bid range comes from the closest
-  same-position claims by expected points: low, likely and aggressive at the 25th, 50th and 75th
-  percentile, with aggressive also clearing the best losing bid seen. With fewer than two close
-  comparables, it places the player within the position's whole claim history instead. Without a
-  player, it ranks the best available targets, skipping anyone out or on IR.
-- **Trade finder.** Player value is the average of the next 3 weeks' Sleeper projections under
-  league scoring, so byes and current roles count. For every other roster it tries each 1-for-1
-  and 2-for-1 swap, recomputes both teams' best starting lineups, and keeps trades that improve
-  yours, cost theirs at most a point a week, and are within 20% on value. In dynasty leagues,
-  value blends rest-of-season VOR with dynasty market value according to `focus`.
-- **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
-  that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
-  from the original owner's standing (worst record picks first). `traded_picks` determines who owns
-  each pick, and the tool warns when the side giving a pick doesn't own it.
-- **Matchups.** `get_my_roster` shows each player's opponent and that defense's rank in points
-  allowed to his position this season.
 
 ## Setup
 

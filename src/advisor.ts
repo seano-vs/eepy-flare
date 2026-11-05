@@ -7,10 +7,13 @@ import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { LeagueContext } from "./league";
 import { isUnavailable, playerContext } from "./nflverse/context";
 import { waiverSchedule, waiverStatuses } from "./waivers";
+import { rankWaiverTargets } from "./waiver-targets";
+import { readPrefs } from "./prefs";
+import { latestHeadlines, playerNews, roleSignal } from "./news";
 import { NflData, expectedPoints } from "./nflverse/stats";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { computeReplacement, lastFantasyWeek, optimalLineup, round, weekPool, type SkillPos } from "./scoring";
-import { standingsFromMatchups } from "./playoffs";
+import { loadSeason, runOdds, standingsFromMatchups } from "./playoffs";
 import { sleeper, type Roster } from "./sleeper";
 
 // ================================================================ FAAB
@@ -252,6 +255,22 @@ export const pickSchema = z.object({
 	from: z.string().optional().describe("Original owner (team/owner name); default: the side trading it."),
 });
 
+// ================================================================ value-based bids
+
+/**
+ * "Your max": what he's worth to your roster at this league's going rate, keeping a reserve.
+ * Pure; exported for tests.
+ */
+export function valueBid(gainPerWeek: number, weeksCounted: number, dollarsPerPoint: number, remaining: number, reserve: number): number {
+	const value = Math.max(0, gainPerWeek) * weeksCounted * dollarsPerPoint;
+	return Math.max(0, Math.min(Math.round(value), remaining - reserve));
+}
+
+/** Keep more in reserve early in the season: 5% per week left, between 10% and 40%. */
+export function reserveFor(remaining: number, weeksLeft: number): number {
+	return Math.round(remaining * Math.min(0.4, Math.max(0.1, 0.05 * weeksLeft)));
+}
+
 // ================================================================ tools
 
 export function registerAdvisorTools(server: McpServer, env: Env): void {
@@ -262,7 +281,8 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 			title: "FAAB bid advice",
 			description:
 				"Suggest FAAB bids from this league's own bidding history: past claims are matched to the target by position and expected fantasy points (league scoring) in the weeks before the claim. " +
-				"Includes your remaining budget and how many teams could outbid you. Omit player to get bids for the best available players by recent expected points.",
+				"Includes your remaining budget and how many teams could outbid you. Omit player to get bids for the best available players, ranked on this week's projection and recent expected points and re-ranked by their latest headline " +
+				"(benched, No. 3, traded or released demotes; named starter promotes). Read role_news and news before bidding.",
 			inputSchema: z.object({
 				player: z.string().optional().describe("Target player (name or Sleeper id). Omit for top available targets."),
 				position: z.enum(["QB", "RB", "WR", "TE"]).optional(),
@@ -321,26 +341,57 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 
 				const owned = lc.ownership();
 				const from = Math.max(1, latest - 2);
-				const report = new Map((await nfl.currentInjuries()).rows.map((r) => [maps.byGsis.get(String(r.gsis_id)), r.report_status]));
-				let targets: string[];
-				if (player) {
-					targets = [lc.players.resolve(player).id];
-				} else {
-					targets = [...xfpBy.keys()]
-						.filter((sid) => !owned.has(sid))
-						.filter((sid) => {
-							const p = lc.players.get(sid);
-							// Skip players who can't help soon: their recent usage predates the injury.
-							const unavailable = !include_injured && isUnavailable(p, report.get(sid));
-							return p && !unavailable && ["QB", "RB", "WR", "TE"].includes(p.pos) && (!position || p.pos === position);
-						})
-						.map((sid) => ({ sid, x: xfpWindow(sid, from, latest) ?? 0 }))
-						.sort((a, b) => b.x - a.x)
-						.slice(0, limit ?? 8)
-						.map((t) => t.sid);
-				}
+				// Ranked on this week's projection and recent expected points, re-ranked by headlines.
+				const ranked = player ? null : await rankWaiverTargets(lc, { position, includeInjured: include_injured, limit: limit ?? 8 });
+				const rankedBy = new Map((ranked?.targets ?? []).map((t) => [t.id, t]));
+				const targets: string[] = player ? [lc.players.resolve(player).id] : (ranked?.targets ?? []).map((t) => t.id);
+				const singleNews = player ? await playerNews(targets[0]!, { limit: 1, maxAgeHours: 96 }) : [];
 				const [ctx, waivers, schedule] = await Promise.all([playerContext(lc, targets), waiverStatuses(lc, targets), waiverSchedule(lc).catch(() => null)]);
 				const myLeft = remaining(me);
+
+				// Value to this roster (price at value, keep a reserve, let a higher bidder win).
+				const prefs = readPrefs(lc.env, lc.players);
+				const slots = lc.league.roster_positions.filter((x) => x !== "BN");
+				const lastWeek = lastFantasyWeek(lc.league);
+				const playoffStart = Number(lc.league.settings.playoff_week_start) || 15;
+				const [{ byWeek, current }, season] = await Promise.all([
+					nearTermPpg(lc, lc.week, Math.min(4, Math.max(1, lastWeek - lc.week + 1))),
+					loadSeason(lc).catch(() => null),
+				]);
+				const myOdds = season?.schedule.length ? (runOdds(lc, season).odds.get(me.roster_id)?.playoffs ?? 0) / 100 : 1;
+				const regLeft = Math.max(0, playoffStart - lc.week);
+				const playoffWeeks = Math.max(0, lastWeek - Math.max(lc.week, playoffStart) + 1);
+				const weeksCounted = round(regLeft + playoffWeeks * myOdds, 1);
+				const activeOf = (r: Roster) => {
+					const res = new Set([...(r.reserve ?? []), ...(r.taxi ?? [])]);
+					return (r.players ?? []).filter((id) => !res.has(id));
+				};
+				const myActive = activeOf(me);
+				const lineupAvg = (ids: string[]) => (byWeek.length ? byWeek.reduce((a, m) => a + optimalLineup(ids, slots, m).total, 0) / byWeek.length : 0);
+				const myBase = lineupAvg(myActive);
+				// Going rate: winning bid per point over replacement per remaining week, at claim time.
+				const repl = current.length ? computeReplacement(current, lc.league.roster_positions, lc.league.total_rosters) : null;
+				const rates = repl
+					? history
+							.filter((h) => h.winning > 0 && h.xfp != null)
+							.map((h) => {
+								const por = (h.xfp ?? 0) - (repl.level[h.pos as SkillPos] ?? 0);
+								return por > 0.5 ? h.winning / (por * Math.max(1, lastWeek - h.week + 1)) : null;
+							})
+							.filter((x): x is number => x != null)
+							.sort((a, b) => a - b)
+					: [];
+				const dollarsPerPoint = rates.length ? round(quantile(rates, 0.5), 3) : 0.5;
+				const reserve = reserveFor(myLeft, lastWeek - lc.week);
+				const needsDrop = (me.players ?? []).length - (me.reserve ?? []).length - (me.taxi ?? []).length >= lc.league.roster_positions.length;
+				// Lowest-value droppable player: smallest drop in your best lineup, never an untouchable.
+				const dropCandidate = needsDrop
+					? myActive
+							.filter((id) => !prefs.untouchables.has(id))
+							.map((id) => ({ id, loss: myBase - lineupAvg(myActive.filter((x) => x !== id)) }))
+							.sort((a, b) => a.loss - b.loss)[0]
+					: undefined;
+				const teamName = (rid: number) => lc.team(rid).team_name ?? lc.team(rid).owner;
 				const advice = targets.map((sid) => {
 					const p = lc.players.get(sid)!;
 					const x = xfpWindow(sid, from, latest);
@@ -350,7 +401,13 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						player: fmt(p),
 						league_status: owned.has(sid) ? lc.team(owned.get(sid)!).owner : "available",
 						...(waivers.get(sid) ? { waiver: waivers.get(sid) } : {}),
+						...(rankedBy.get(sid)?.proj_week != null ? { proj_week: rankedBy.get(sid)!.proj_week } : {}),
 						...(x != null ? { xfp_recent: round(x, 1) } : {}),
+						...(() => {
+							const n = rankedBy.get(sid)?.news ?? singleNews[0];
+							const sig = rankedBy.get(sid)?.role_news ?? (n ? roleSignal(n.title) : null);
+							return { ...(n ? { news: `${n.title} (${n.source}, ${n.age_hours}h ago)` } : {}), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}) };
+						})(),
 						...(c?.recent ? { recent: { snap_pct: c.recent.snap_pct, targets: c.recent.targets, carries: c.recent.carries, rz_opps: c.recent.rz_opps } } : {}),
 						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 						...(waivers.get(sid)?.status === "free agent" && !owned.has(sid)
@@ -358,13 +415,53 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 							: s
 								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
 								: { bid: null, basis: x == null ? "no recent usage data" : `no ${p.pos} claims in this league yet` }),
+						...(() => {
+							const gain = round(lineupAvg([...myActive, sid]) - myBase, 1);
+							const yourMax = valueBid(gain, weeksCounted, dollarsPerPoint, myLeft, reserve);
+							const share = (b: number) => (myLeft ? Math.round((b / myLeft) * 100) : 0);
+							const fa = waivers.get(sid)?.status === "free agent" && !owned.has(sid);
+							const m = fa ? null : s;
+							const market = m?.likely ?? null;
+							// Rivals: can afford the likely bid and would start him this week.
+							const wk = byWeek[0];
+							const rivals = wk
+								? lc.rosters
+										.filter((r) => r.roster_id !== me.roster_id && remaining(r) > (market ?? 0))
+										.filter((r) => optimalLineup([...activeOf(r), sid], slots, wk).total - optimalLineup(activeOf(r), slots, wk).total > 1)
+										.map((r) => `${teamName(r.roster_id)} ($${remaining(r)})`)
+								: [];
+							return {
+								value_to_you: {
+									lineup_gain_per_week: gain,
+									your_max: yourMax,
+									your_max_pct_of_budget: share(yourMax),
+									...(m ? { market_likely_pct_of_budget: share(m.likely), market_aggressive_pct_of_budget: share(m.aggressive) } : {}),
+									...(m && share(m.aggressive) > 20 ? { warning: `The aggressive market bid is ${share(m.aggressive)}% of your remaining $${myLeft}.` } : {}),
+									...(gain <= 0
+										? { note: "He wouldn't start for you over the next few weeks; bid only as a stash." }
+										: market != null && yourMax < market
+											? { note: "The market will likely pay more than he's worth to you: let a higher bidder win." }
+											: {}),
+								},
+								...(rivals.length && !fa ? { likely_rival_bidders: rivals } : {}),
+							};
+						})(),
 					};
 				});
 				return ok({
 					budget,
 					my_remaining: myLeft,
-					...(schedule ? { waivers_process: schedule.daily ? `daily around ${schedule.processes_at_utc ?? "?"}` : `${schedule.process_days[0] ?? "?"} around ${schedule.processes_at_utc ?? "?"}`, waiver_clear_days: schedule.clear_days } : {}),
+					...(schedule ? { waivers: { main_run: schedule.main_run, processes_at: schedule.processes_at?.eastern ?? null, clear_days: schedule.clear_days } } : {}),
 					others_remaining: { max: others[0] ?? 0, median: round(quantile([...others].sort((a, b) => a - b), 0.5), 0) },
+					pricing: {
+						reserve,
+						dollars_per_point: dollarsPerPoint,
+						weeks_counted: weeksCounted,
+						your_playoff_odds_pct: round(myOdds * 100, 1),
+						rule: "your_max = weekly gain to your best lineup x weeks counted (regular-season weeks left + playoff weeks x your playoff odds) x the league's going $/point, capped at remaining minus reserve. If the market goes higher, let it.",
+					},
+					...(needsDrop ? { roster_full: true, suggested_drop: dropCandidate ? { player: fmt(lc.ref(dropCandidate.id)), lineup_loss_per_week: round(dropCandidate.loss, 1) } : null } : {}),
+					...(prefs.untouchableNames.length ? { untouchables: prefs.untouchableNames } : {}),
 					weeks: `${from}-${latest}`,
 					claims_in_history: history.length,
 					advice,
@@ -390,8 +487,8 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 			inputSchema: z.object({
 				need: z.enum(["QB", "RB", "WR", "TE"]).optional().describe("Only trades that bring you this position."),
 				partner: z.string().optional().describe("Only this team (owner or team name)."),
-				focus: z.enum(["win_now", "balanced", "long_term"]).optional().describe("How to weigh this season vs dynasty value (default balanced; long_term needs a dynasty league)."),
-				exclude: z.array(z.string()).max(10).optional().describe("Your players who are off the table."),
+				focus: z.enum(["win_now", "balanced", "long_term"]).optional().describe("How to weigh this season vs dynasty value (default from DEFAULT_TRADE_FOCUS, else balanced; long_term needs a dynasty league)."),
+				exclude: z.array(z.string()).max(10).optional().describe("Your players who are off the table (configured untouchables are always excluded)."),
 				shop: z.string().optional().describe("Only trades that move this player of yours."),
 				window: z.enum(["next3", "playoffs"]).optional().describe("Weeks to score lineups on: the next 3 (default) or the fantasy playoff weeks."),
 				limit: z.number().int().min(1).max(15).optional().describe("Trades to return (default 6)."),
@@ -403,26 +500,27 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const lc = await LeagueContext.load(env);
 				const me = lc.myRoster();
 				const dynasty = isDynasty(lc.league);
-				const mode = focus ?? "balanced";
+				const prefs = readPrefs(lc.env, lc.players);
+				const mode = focus ?? prefs.focus;
 				const slots = lc.league.roster_positions.filter((s) => s !== "BN");
 				const through = Math.max(lc.week, lastFantasyWeek(lc.league));
 				const weeksLeft = Math.max(1, through - lc.week + 1);
 				const playoffStart = Number(lc.league.settings.playoff_week_start) || 15;
 				const usePlayoffs = windowArg === "playoffs" && playoffStart > lc.week;
-				const [{ ppg, current, weeks: window, byWeek }, adp, results] = await Promise.all([
+				const [{ ppg, current, weeks: window, byWeek }, adp, season] = await Promise.all([
 					usePlayoffs ? nearTermPpg(lc, playoffStart, Math.max(1, lastFantasyWeek(lc.league) - playoffStart + 1)) : nearTermPpg(lc, lc.week, 3),
 					dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>),
-					Promise.all(
-						Array.from({ length: Math.max(0, Number(lc.league.settings.last_scored_leg) || lc.week - 1) }, (_, i) =>
-							sleeper.matchups(lc.config.leagueId, i + 1).catch(() => []),
-						),
-					),
+					loadSeason(lc),
 				]);
-				// Partner outlook from actual results: top half contends, bottom half rebuilds.
-				const standings = standingsFromMatchups(results, lc.rosters.map((r) => r.roster_id));
-				const ranked = [...standings.values()].sort((a, b) => b.wins - a.wins || b.pf - a.pf).map((r) => r.roster_id);
-				const outlook = (rid: number) => (ranked.indexOf(rid) < Math.ceil(ranked.length / 2) ? "contending" : "rebuilding");
-				const excluded = new Set((exclude ?? []).map((q) => lc.players.resolve(q).id));
+				// Partner outlook from playoff odds: a 4-4 team with 50% odds is a bubble team, not a rebuilder.
+				const standings = season.standings;
+				const odds = season.schedule.length ? runOdds(lc, season).odds : new Map<number, { playoffs: number }>();
+				const outlook = (rid: number): "contending" | "bubble" | "rebuilding" => {
+					const o = odds.get(rid)?.playoffs;
+					if (o == null) return "bubble";
+					return o > 60 ? "contending" : o >= 20 ? "bubble" : "rebuilding";
+				};
+				const excluded = new Set([...(exclude ?? []).map((q) => lc.players.resolve(q).id), ...prefs.untouchables]);
 				const shopId = shop ? lc.players.resolve(shop).id : undefined;
 				const repl = current.length ? computeReplacement(current, lc.league.roster_positions, lc.league.total_rosters) : null;
 
@@ -450,6 +548,18 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				};
 
 				const mine = active(me);
+
+				// Discount projections that assume a bigger role than recent usage: halfway to recent xfp.
+				const allActive = [...new Set(lc.rosters.flatMap((r) => active(r)))];
+				const ctxAll = await playerContext(lc, allActive, { projections: new Map(allActive.map((id) => [id, byWeek[0]?.get(id)?.pts ?? null])) });
+				const discounted = new Map<string, number>();
+				for (const [id, c] of ctxAll) {
+					const proj = ppg.get(id)?.pts;
+					const x = c.recent?.xfp;
+					if (proj && x != null && c.role_change?.some((f) => f.includes("bigger role"))) discounted.set(id, Math.min(1, (proj + x) / 2 / proj));
+				}
+				for (const m of byWeek) for (const [id, f] of discounted) { const e = m.get(id); if (e) m.set(id, { ...e, pts: round(e.pts * f, 2) }); }
+				for (const [id, f] of discounted) { const e = ppg.get(id); if (e) ppg.set(id, { ...e, pts: round(e.pts * f, 2) }); }
 				const myBase = lineup(mine);
 				const partners = lc.rosters.filter((r) => r.roster_id !== me.roster_id && (!partner || r.roster_id === lc.findRoster(partner).roster_id));
 				type Deal = { partner: Roster; give: string[]; get: string[]; myGain: number; theirGain: number; fair: number; giveW: ReturnType<typeof worth>; getW: ReturnType<typeof worth> };
@@ -469,9 +579,11 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						const theirGain = round(theirAfter - theirBase, 1);
 						// They may accept a small weekly dip when the value is fair (or favors them long-term).
 						if (shopId && !give.includes(shopId)) return;
-						// Contenders won't take a weekly hit; rebuilding teams accept a small one for long-term value.
-						const contending = outlook(r.roster_id) === "contending";
-						if (myGain <= (shopId ? -0.5 : 0.5) || theirGain < (contending ? 0 : -2)) return;
+						// Contenders won't take a weekly hit, bubble teams barely, rebuilders accept one for long-term value.
+						const look = outlook(r.roster_id);
+						const contending = look !== "rebuilding";
+						const floor = look === "contending" ? 0 : look === "bubble" ? -0.5 : -2;
+						if (myGain <= (shopId ? -0.5 : 0.5) || theirGain < floor) return;
 						const giveW = worth(give.map(asset));
 						const getW = worth(get.map(asset));
 						const fair = Math.max(giveW.score, getW.score) > 0 ? Math.abs(getW.score - giveW.score) / Math.max(giveW.score, getW.score) : 0;
@@ -495,11 +607,19 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					return true;
 				});
 				const windowLabel = window.length ? `${window[0]}-${window[window.length - 1]}` : "";
+				const finalDeals = picked.slice(0, limit ?? 6);
+				const heads = await latestHeadlines([...new Set(finalDeals.flatMap((d) => [...d.give, ...d.get]))], 96);
 				const side = (ids: string[]) =>
 					ids.map((id) => {
 						const a = asset(id);
+						const c = ctxAll.get(id);
+						const h = heads.get(id);
 						return {
 							player: fmt(lc.ref(id)),
+							...(c?.injury_report ? { injury_report: c.injury_report } : {}),
+							...(c?.role_change ? { role_change: c.role_change } : {}),
+							...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}),
+							...(discounted.has(id) ? { projection_discounted: "Sleeper's projection assumes a bigger role than recent usage; scored halfway to recent expected points." } : {}),
 							// Sleeper projection per game in the weeks of the window he's projected to play.
 							proj_ppg_window: a.ppg,
 							games_in_window: `${a.games}/${window.length}`,
@@ -509,16 +629,18 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					});
 				return ok({
 					focus: mode,
+					...(prefs.untouchableNames.length ? { untouchables: prefs.untouchableNames } : {}),
 					weeks: `${lc.week}-${through}`,
 					lineup_window: usePlayoffs ? "playoffs" : "next3",
 					projection_window: windowLabel,
-					trades: picked.slice(0, limit ?? 6).map((d) => ({
+					trades: finalDeals.map((d) => ({
 						partner: lc.team(d.partner.roster_id).owner,
 						partner_record: (() => {
 							const st = standings.get(d.partner.roster_id);
 							return st ? `${st.wins}-${st.losses}${st.ties ? `-${st.ties}` : ""}` : undefined;
 						})(),
 						partner_outlook: outlook(d.partner.roster_id),
+						...(odds.get(d.partner.roster_id) ? { partner_playoff_odds_pct: odds.get(d.partner.roster_id)!.playoffs } : {}),
 						give: side(d.give),
 						get: side(d.get),
 						your_lineup_change_per_week: d.myGain,
@@ -533,7 +655,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						"proj_ppg_window = Sleeper's projection per game (league scoring) averaged over the weeks of projection_window he is projected to play; games_in_window says how many. " +
 						"It is not rest-of-season ppg (project_player) or actual ppg (get_player_usage). " +
 						"Lineup change = best projected starting lineup in each window week (byes and projected absences count as 0), averaged, after minus before. " +
-						"Trades must help you, not cost a contending partner lineup points (a rebuilding partner may lose up to 2 a week if they gain dynasty value), and be within 20% on value (" +
+						"partner_outlook comes from playoff odds (>60% contending, 20-60% bubble, <20% rebuilding). Trades must help you, cost a contender nothing and a bubble team at most 0.5 a week (a rebuilder up to 2, if it gains dynasty value), and be within 20% on value (" +
 						(dynasty && mode !== "win_now" ? "a blend of rest-of-season VOR and dynasty market value" : "rest-of-season VOR") +
 						"). Run evaluate_trade on any of these for the full picture.",
 				});
