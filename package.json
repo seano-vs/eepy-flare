@@ -6,7 +6,7 @@
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "deploy": "wrangler deploy",
-    "cf-typegen": "wrangler types",
+    "cf-typegen": "wrangler types --env-file /dev/null",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "seed-players": "node scripts/seed-players.mjs"

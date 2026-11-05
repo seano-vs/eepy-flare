@@ -17,8 +17,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # Fails if wrangler.jsonc bindings changed without regenerating worker-configuration.d.ts.
-      - run: npx wrangler types --check
+      # Fails if wrangler.jsonc changed without `npm run cf-typegen` (which ignores local .dev.vars).
+      - run: npx wrangler types --check --env-file /dev/null
       - run: npm run typecheck
       - run: npm test
       - run: npx wrangler deploy --dry-run --outdir dist
