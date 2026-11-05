@@ -272,6 +272,32 @@ export interface PlayerValuation {
 	key_stats?: Record<string, number>;
 	/** Projection assumptions to check against current news before relying on them. */
 	verify?: string[];
+	/** How Sleeper's weekly projections compared with his actual points in games played so far. */
+	projection_track_record?: TrackRecord;
+}
+
+export interface TrackRecord {
+	games: number;
+	avg_projected: number;
+	avg_actual: number;
+	/** (projected - actual) / actual: positive means Sleeper has projected him too high. */
+	bias_pct: number;
+	/** Mean absolute miss per game, in points. */
+	avg_miss: number;
+}
+
+/** Pure; exported for tests. Needs 3+ games. */
+export function projectionTrackRecord(pairs: { proj: number; actual: number }[]): TrackRecord | undefined {
+	if (pairs.length < 3) return undefined;
+	const p = pairs.reduce((a, x) => a + x.proj, 0) / pairs.length;
+	const a = pairs.reduce((s, x) => s + x.actual, 0) / pairs.length;
+	return {
+		games: pairs.length,
+		avg_projected: round(p, 1),
+		avg_actual: round(a, 1),
+		bias_pct: a > 0 ? Math.round(((p - a) / a) * 100) : 0,
+		avg_miss: round(pairs.reduce((s, x) => s + Math.abs(x.proj - x.actual), 0) / pairs.length, 1),
+	};
 }
 
 export interface WeekSummary {
@@ -382,16 +408,23 @@ export async function valuePlayer(opts: {
 	// Season to date, from actual stats (also undocumented; skipped if missing).
 	let seasonPts = 0;
 	let seasonGames = 0;
+	const pairs: { proj: number; actual: number }[] = [];
 	for (const [w, wk] of parsePlayerWeeks(statsRaw)) {
 		if (w >= opts.week || !wk || !plays(wk.stats)) continue;
-		seasonPts += scoreStats(wk.stats, scoring);
+		const actual = scoreStats(wk.stats, scoring);
+		seasonPts += actual;
 		seasonGames++;
+		// Sleeper keeps past weeks' projections, so we can see how its numbers have tracked him.
+		const pw = weeks.get(w);
+		if (pw && plays(pw.stats)) pairs.push({ proj: scoreStats(pw.stats, scoring), actual });
 	}
 	if (statsRaw) {
 		v.season_pts = round(seasonPts, 1);
 		v.season_games = seasonGames;
 		if (seasonGames) v.season_ppg = round(seasonPts / seasonGames, 1);
 	}
+	const track = projectionTrackRecord(pairs);
+	if (track) v.projection_track_record = track;
 
 	if (opts.includeWeeks) v.weeks = sum.perWeek;
 	if (playsNow) {

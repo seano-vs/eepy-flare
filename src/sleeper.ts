@@ -174,6 +174,8 @@ export const sleeper = {
 			`${SLEEPER_COM}/projections/nfl/player/${enc(playerId)}?season_type=${enc(seasonType)}&season=${enc(season)}&grouping=week`,
 			1800,
 		),
+	/** Undocumented: a player's recent news items (headline, source, published ms), newest first. */
+	playerNews: (playerId: string) => getJson<unknown>(`${SLEEPER_COM}/players/nfl/${enc(playerId)}/news`, 900),
 	/** Undocumented: one player's actual stats for every week of a season, keyed by week. */
 	playerStats: (playerId: string, season: string, seasonType: string) =>
 		getJson<unknown>(

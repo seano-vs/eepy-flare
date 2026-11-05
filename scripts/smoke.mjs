@@ -41,6 +41,10 @@ const calls = [
 	["get_defense_vs_position", { position: "WR" }],
 	["get_faab_advice", { limit: 3 }],
 	["find_trades", { limit: 3 }],
+	["find_trades", { window: "playoffs", limit: 2 }],
+	["get_playoff_odds", {}],
+	["get_team_needs", { team: "me" }],
+	["get_player_news", { players: ["Josh Allen"], days: 7 }],
 	["evaluate_trade", { give: ["Josh Allen"], get_picks: [{ season: String(new Date().getFullYear() + 1), round: 1 }] }],
 ];
 

@@ -6,9 +6,11 @@ import { z } from "zod";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { LeagueContext } from "./league";
 import { isUnavailable, playerContext } from "./nflverse/context";
+import { waiverSchedule, waiverStatuses } from "./waivers";
 import { NflData, expectedPoints } from "./nflverse/stats";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { computeReplacement, lastFantasyWeek, optimalLineup, round, weekPool, type SkillPos } from "./scoring";
+import { standingsFromMatchups } from "./playoffs";
 import { sleeper, type Roster } from "./sleeper";
 
 // ================================================================ FAAB
@@ -337,7 +339,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						.slice(0, limit ?? 8)
 						.map((t) => t.sid);
 				}
-				const ctx = await playerContext(lc, targets);
+				const [ctx, waivers, schedule] = await Promise.all([playerContext(lc, targets), waiverStatuses(lc, targets), waiverSchedule(lc).catch(() => null)]);
 				const myLeft = remaining(me);
 				const advice = targets.map((sid) => {
 					const p = lc.players.get(sid)!;
@@ -347,24 +349,29 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					return {
 						player: fmt(p),
 						league_status: owned.has(sid) ? lc.team(owned.get(sid)!).owner : "available",
+						...(waivers.get(sid) ? { waiver: waivers.get(sid) } : {}),
 						...(x != null ? { xfp_recent: round(x, 1) } : {}),
 						...(c?.recent ? { recent: { snap_pct: c.recent.snap_pct, targets: c.recent.targets, carries: c.recent.carries, rz_opps: c.recent.rz_opps } } : {}),
 						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
-						...(s
-							? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
-							: { bid: null, basis: x == null ? "no recent usage data" : `no ${p.pos} claims in this league yet` }),
+						...(waivers.get(sid)?.status === "free agent" && !owned.has(sid)
+							? { bid: null, add_now: "Free agent: add him now for $0 (no claim needed) before someone else does." }
+							: s
+								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
+								: { bid: null, basis: x == null ? "no recent usage data" : `no ${p.pos} claims in this league yet` }),
 					};
 				});
 				return ok({
 					budget,
 					my_remaining: myLeft,
+					...(schedule ? { waivers_process: schedule.daily ? `daily around ${schedule.processes_at_utc ?? "?"}` : `${schedule.process_days[0] ?? "?"} around ${schedule.processes_at_utc ?? "?"}`, waiver_clear_days: schedule.clear_days } : {}),
 					others_remaining: { max: others[0] ?? 0, median: round(quantile([...others].sort((a, b) => a - b), 0.5), 0) },
 					weeks: `${from}-${latest}`,
 					claims_in_history: history.length,
 					advice,
 					note:
 						"Bids come from this league's winning bids for players at the same position with similar expected points per game (league scoring) in the 3 weeks before the claim. " +
-						"aggressive also clears the best losing bid seen on those comparables. Players already through waivers can be added as free agents for $0.",
+						"aggressive also clears the best losing bid seen on those comparables. waiver.status: 'on waivers' = dropped within the clear window (bid); 'free agent' = add now for $0. " +
+						"Sleeper also locks players on waivers once their game kicks off until the next run, which this can't see.",
 				});
 			} catch (e) {
 				return fail(e);
@@ -384,11 +391,14 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				need: z.enum(["QB", "RB", "WR", "TE"]).optional().describe("Only trades that bring you this position."),
 				partner: z.string().optional().describe("Only this team (owner or team name)."),
 				focus: z.enum(["win_now", "balanced", "long_term"]).optional().describe("How to weigh this season vs dynasty value (default balanced; long_term needs a dynasty league)."),
+				exclude: z.array(z.string()).max(10).optional().describe("Your players who are off the table."),
+				shop: z.string().optional().describe("Only trades that move this player of yours."),
+				window: z.enum(["next3", "playoffs"]).optional().describe("Weeks to score lineups on: the next 3 (default) or the fantasy playoff weeks."),
 				limit: z.number().int().min(1).max(15).optional().describe("Trades to return (default 6)."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ need, partner, focus, limit }) => {
+		async ({ need, partner, focus, exclude, shop, window: windowArg, limit }) => {
 			try {
 				const lc = await LeagueContext.load(env);
 				const me = lc.myRoster();
@@ -397,7 +407,23 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const slots = lc.league.roster_positions.filter((s) => s !== "BN");
 				const through = Math.max(lc.week, lastFantasyWeek(lc.league));
 				const weeksLeft = Math.max(1, through - lc.week + 1);
-				const [{ ppg, current, weeks: window, byWeek }, adp] = await Promise.all([nearTermPpg(lc, lc.week, 3), dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>)]);
+				const playoffStart = Number(lc.league.settings.playoff_week_start) || 15;
+				const usePlayoffs = windowArg === "playoffs" && playoffStart > lc.week;
+				const [{ ppg, current, weeks: window, byWeek }, adp, results] = await Promise.all([
+					usePlayoffs ? nearTermPpg(lc, playoffStart, Math.max(1, lastFantasyWeek(lc.league) - playoffStart + 1)) : nearTermPpg(lc, lc.week, 3),
+					dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>),
+					Promise.all(
+						Array.from({ length: Math.max(0, Number(lc.league.settings.last_scored_leg) || lc.week - 1) }, (_, i) =>
+							sleeper.matchups(lc.config.leagueId, i + 1).catch(() => []),
+						),
+					),
+				]);
+				// Partner outlook from actual results: top half contends, bottom half rebuilds.
+				const standings = standingsFromMatchups(results, lc.rosters.map((r) => r.roster_id));
+				const ranked = [...standings.values()].sort((a, b) => b.wins - a.wins || b.pf - a.pf).map((r) => r.roster_id);
+				const outlook = (rid: number) => (ranked.indexOf(rid) < Math.ceil(ranked.length / 2) ? "contending" : "rebuilding");
+				const excluded = new Set((exclude ?? []).map((q) => lc.players.resolve(q).id));
+				const shopId = shop ? lc.players.resolve(shop).id : undefined;
 				const repl = current.length ? computeReplacement(current, lc.league.roster_positions, lc.league.total_rosters) : null;
 
 				const asset = (id: string): TradeAsset => {
@@ -430,7 +456,8 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const deals: Deal[] = [];
 				// Only players with real value are worth searching over.
 				const tradable = (ids: string[]) => ids.filter((id) => asset(id).ros_vor > 0 || asset(id).dynasty_value > 1500);
-				const myTradable = tradable(mine);
+				const myTradable = tradable(mine).filter((id) => !excluded.has(id));
+				if (shopId && !mine.includes(shopId)) return fail(`${fmt(lc.ref(shopId))} isn't on your active roster.`);
 				for (const r of partners) {
 					const theirs = active(r);
 					const theirBase = lineup(theirs);
@@ -441,11 +468,16 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						const myGain = round(myAfter - myBase, 1);
 						const theirGain = round(theirAfter - theirBase, 1);
 						// They may accept a small weekly dip when the value is fair (or favors them long-term).
-						if (myGain <= 0.5 || theirGain < -1) return;
+						if (shopId && !give.includes(shopId)) return;
+						// Contenders won't take a weekly hit; rebuilding teams accept a small one for long-term value.
+						const contending = outlook(r.roster_id) === "contending";
+						if (myGain <= (shopId ? -0.5 : 0.5) || theirGain < (contending ? 0 : -2)) return;
 						const giveW = worth(give.map(asset));
 						const getW = worth(get.map(asset));
 						const fair = Math.max(giveW.score, getW.score) > 0 ? Math.abs(getW.score - giveW.score) / Math.max(giveW.score, getW.score) : 0;
 						if (fair > 0.2) return; // a deal the other side would reject on value
+						// A rebuilding partner taking a lineup dip should at least gain dynasty value.
+						if (dynasty && !contending && theirGain < 0 && getW.dyn > giveW.dyn) return;
 						deals.push({ partner: r, give, get, myGain, theirGain, fair, giveW, getW });
 					};
 					for (const g of myTradable) for (const t of theirTradable) tryDeal([g], [t]);
@@ -468,9 +500,9 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						const a = asset(id);
 						return {
 							player: fmt(lc.ref(id)),
-							// Sleeper projection per game in weeks he's projected to play, over the next 3 weeks.
-							proj_ppg_next3: a.ppg,
-							games_next3: `${a.games}/${window.length}`,
+							// Sleeper projection per game in the weeks of the window he's projected to play.
+							proj_ppg_window: a.ppg,
+							games_in_window: `${a.games}/${window.length}`,
 							ros_vor: a.ros_vor,
 							...(dynasty ? { dynasty_value: a.dynasty_value } : {}),
 						};
@@ -478,9 +510,15 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				return ok({
 					focus: mode,
 					weeks: `${lc.week}-${through}`,
+					lineup_window: usePlayoffs ? "playoffs" : "next3",
 					projection_window: windowLabel,
 					trades: picked.slice(0, limit ?? 6).map((d) => ({
 						partner: lc.team(d.partner.roster_id).owner,
+						partner_record: (() => {
+							const st = standings.get(d.partner.roster_id);
+							return st ? `${st.wins}-${st.losses}${st.ties ? `-${st.ties}` : ""}` : undefined;
+						})(),
+						partner_outlook: outlook(d.partner.roster_id),
 						give: side(d.give),
 						get: side(d.get),
 						your_lineup_change_per_week: d.myGain,
@@ -492,10 +530,10 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					})),
 					...(picked.length ? {} : { note: "No fair trade improves both lineups under these filters." }),
 					method:
-						"proj_ppg_next3 = Sleeper's projection per game (league scoring) averaged over the weeks of projection_window he's projected to play; games_next3 says how many. " +
+						"proj_ppg_window = Sleeper's projection per game (league scoring) averaged over the weeks of projection_window he is projected to play; games_in_window says how many. " +
 						"It is not rest-of-season ppg (project_player) or actual ppg (get_player_usage). " +
 						"Lineup change = best projected starting lineup in each window week (byes and projected absences count as 0), averaged, after minus before. " +
-						"Trades must help you, cost them at most 1 point a week, and be within 20% on value (" +
+						"Trades must help you, not cost a contending partner lineup points (a rebuilding partner may lose up to 2 a week if they gain dynasty value), and be within 20% on value (" +
 						(dynasty && mode !== "win_now" ? "a blend of rest-of-season VOR and dynasty market value" : "rest-of-season VOR") +
 						"). Run evaluate_trade on any of these for the full picture.",
 				});

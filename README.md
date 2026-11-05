@@ -36,7 +36,10 @@ The server says so to every client and points at the assumptions worth checking.
 | `get_nfl_data_status` | When each nflverse dataset was last checked and last changed, and any sync errors |
 | `get_defense_vs_position` | Fantasy points each defense allows per game to QB/RB/WR/TE under league scoring, ranked |
 | `get_faab_advice` | FAAB bid ranges from this league's own bidding history, matched by position and expected points, plus remaining budgets |
-| `find_trades` | Searches every roster for 1-for-1 and 2-for-1 trades that improve your lineup without hurting theirs, within 20% on value |
+| `find_trades` | Searches every roster for 1-for-1 and 2-for-1 trades that improve your lineup and are fair on value. Options: `exclude`, `shop` one player, `window: "playoffs"`; partners are labeled contending or rebuilding |
+| `get_playoff_odds` | Standings from actual results plus playoff and bye odds from 5,000 simulations of the remaining regular season, including your odds if you win or lose this week |
+| `get_team_needs` | Per team: weak starting slots vs the league, lineup holes in the next two weeks, QB coverage, FAAB left, positions chased on waivers |
+| `get_player_news` | Recent headlines for players (or your whole roster) from the feed the Sleeper app shows |
 
 The nflverse-backed tools use [nflverse](#nflverse-data-d1) data, the same files the
 [nflreadpy](https://pypi.org/project/nflreadpy/) and nflreadr packages download.
@@ -151,6 +154,35 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
   rankings from FantasyPros, both as republished by those projects.
 
 ### Advisors
+
+Since 1.2:
+
+- **News.** Sleeper's own per-player news feed (undocumented; the RotoWire, RotoBaller and
+  FantasyPros blurbs the app shows). `get_my_roster` adds each player's latest headline from the
+  last 72 hours, and the valuation tools add up to two from the last week. A 0 projection with
+  fresh news quotes the headline.
+- **Role changes.** Each player's last 3 weeks are compared with the rest of his season: snap share
+  (±15 points), target share, carries and expected points (each ±30% and a minimum size). The
+  check also flags when Sleeper's projection for this week is far from what recent usage supports.
+  These show up as `role_change` on roster, valuation and trending output.
+- **Projection track record.** `project_player`, `compare_players` and `evaluate_trade` show how
+  Sleeper's weekly projections compared with the player's actual points in games played so far:
+  average projected vs actual, bias % and average miss.
+- **Playoff odds.** Records come from matchup results, which can be ahead of Sleeper's displayed
+  record (`sleeper_record` appears when they differ). For each remaining regular-season week, a
+  team's mean is its best projected lineup that week, where byes and projected absences count,
+  blended 75/25 with its actual points per game. Scores are drawn from a normal distribution with
+  sd = max(18, 17% of the mean), 5,000 runs with a fixed seed, seeded by wins then points for.
+  `evaluate_trade` re-runs this with both rosters swapped and shows playoff odds before and after.
+- **Waivers.** `get_league_settings` adds `waiver_schedule`, built from when this league's claims
+  actually completed. In this league that's daily around 14:00 UTC, with 2 clear days.
+  `get_faab_advice` and trending adds mark each player as `on waivers` (dropped within the clear
+  window, with who dropped him and when he clears) or `free agent` (add now, no bid).
+- **Byes.** Byes come from the NFL schedule, so a week when the team plays but Sleeper projects the
+  player for nothing is `projected_out`, not a bye.
+- **Freshness.** `get_nfl_data_status` also reports the players-cache, projection and ADP fetch
+  times, the FantasyPros rankings date, and which teams haven't posted this week's injury report.
+  `get_my_roster` lists those teams for your players and stamps `fetched_at`.
 
 - **FAAB bids.** Every waiver claim in the league is read from Sleeper's transactions, including
   losing bids. For each claimed player, the server computes expected points per game (league
@@ -404,6 +436,35 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 
 ### Advisors
 
+Since 1.2:
+
+- **News.** Sleeper's own per-player news feed (undocumented; the RotoWire, RotoBaller and
+  FantasyPros blurbs the app shows). `get_my_roster` adds each player's latest headline from the
+  last 72 hours, and the valuation tools add up to two from the last week. A 0 projection with
+  fresh news quotes the headline.
+- **Role changes.** Each player's last 3 weeks are compared with the rest of his season: snap share
+  (±15 points), target share, carries and expected points (each ±30% and a minimum size). The
+  check also flags when Sleeper's projection for this week is far from what recent usage supports.
+  These show up as `role_change` on roster, valuation and trending output.
+- **Projection track record.** `project_player`, `compare_players` and `evaluate_trade` show how
+  Sleeper's weekly projections compared with the player's actual points in games played so far:
+  average projected vs actual, bias % and average miss.
+- **Playoff odds.** Records come from matchup results, which can be ahead of Sleeper's displayed
+  record (`sleeper_record` appears when they differ). For each remaining regular-season week, a
+  team's mean is its best projected lineup that week, where byes and projected absences count,
+  blended 75/25 with its actual points per game. Scores are drawn from a normal distribution with
+  sd = max(18, 17% of the mean), 5,000 runs with a fixed seed, seeded by wins then points for.
+  `evaluate_trade` re-runs this with both rosters swapped and shows playoff odds before and after.
+- **Waivers.** `get_league_settings` adds `waiver_schedule`, built from when this league's claims
+  actually completed. In this league that's daily around 14:00 UTC, with 2 clear days.
+  `get_faab_advice` and trending adds mark each player as `on waivers` (dropped within the clear
+  window, with who dropped him and when he clears) or `free agent` (add now, no bid).
+- **Byes.** Byes come from the NFL schedule, so a week when the team plays but Sleeper projects the
+  player for nothing is `projected_out`, not a bye.
+- **Freshness.** `get_nfl_data_status` also reports the players-cache, projection and ADP fetch
+  times, the FantasyPros rankings date, and which teams haven't posted this week's injury report.
+  `get_my_roster` lists those teams for your players and stamps `fetched_at`.
+
 - **FAAB bids.** Every waiver claim in the league is read from Sleeper's transactions, including
   losing bids. For each claimed player, the server computes expected points per game (league
   scoring) over the 3 weeks before the claim. A target's bid range comes from the closest
@@ -498,4 +559,9 @@ npm test                 # vitest: scoring, replacement level, lineup optimizer,
 | `src/nflverse/context.ts` | Compact per-player context (usage, rankings, injuries) used by the existing tools |
 | `src/result.ts` | Shared tool-result helpers |
 | `src/advisor.ts` | FAAB advice, trade finder and draft-pick valuation |
+| `src/league-tools.ts` | Playoff odds, team needs and player news tools |
+| `src/playoffs.ts` | Standings from matchups and the playoff simulation |
+| `src/waivers.ts` | Waiver schedule inference and per-player waiver status |
+| `src/news.ts` | Sleeper per-player news feed |
+| `src/verify.ts` | Verify notes on valued players (from PR #1) |
 | `.github/workflows/ci.yml` | CI: `wrangler types --check`, typecheck, tests, dry-run build |

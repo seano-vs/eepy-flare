@@ -33,6 +33,8 @@ export interface Consensus {
 
 export interface PlayerContext {
 	recent?: RecentUsage;
+	/** Usage that has moved a lot in the last 3 weeks vs earlier in the season, or a projection far from recent usage. */
+	role_change?: string[];
 	ecr?: Consensus;
 	/** Current official report, e.g. "Questionable (Ankle), Limited". */
 	injury_report?: string;
@@ -73,10 +75,61 @@ export function isUnavailable(p: { injury?: string; status?: string } | undefine
 	return typeof reportStatus === "string" && /^(Out|Doubtful)$/i.test(reportStatus);
 }
 
+type Usage = Omit<RecentUsage, "weeks">;
+
+/** Per-game usage over a set of player-weeks (undefined when he didn't play). */
+function usageOver(st: Row[], sn: Row[], o: Row[], p: Row[], pos: string | undefined, scoring: Record<string, number>): Usage | undefined {
+	if (!st.length) return undefined;
+	const games = st.length;
+	const per = (rows: Row[], f: (r: Row) => number) => round(rows.reduce((a, r) => a + f(r), 0) / games, 1);
+	const u: Usage = { games };
+	if (sn.length) u.snap_pct = round(mean(sn.map((r) => num(r, "offense_pct"))) * 100, 1);
+	if (pos !== "QB") {
+		u.targets = per(st, (r) => num(r, "targets"));
+		u.tgt_share = round(mean(st.map((r) => num(r, "target_share"))) * 100, 1);
+	}
+	if (pos === "RB" || pos === "QB") u.carries = per(st, (r) => num(r, "carries"));
+	if (p.length) u.rz_opps = per(p, (r) => num(r, "rz_targets") + num(r, "rz_carries"));
+	u.pts = per(st, (r) => leaguePoints(r, scoring));
+	// Expected points per game played: a no-touch week contributes zero.
+	if (o.length) u.xfp = round(o.reduce((a, r) => a + expectedPoints(r, scoring), 0) / Math.max(o.length, games), 1);
+	return u;
+}
+
+/**
+ * Plain-language flags when the last few weeks differ sharply from earlier in the season, or
+ * when Sleeper's projection for this week is far from what recent usage supports.
+ * Pure; exported for tests.
+ */
+export function roleFlags(recent: Usage, earlier: Usage | undefined, projection: number | null): string[] {
+	const flags: string[] = [];
+	if (earlier && earlier.games >= 2 && recent.games >= 2) {
+		const cmp = (label: string, r: number | undefined, e: number | undefined, absMin: number, unit = "", relMin = 0.3) => {
+			if (r == null || e == null) return;
+			const d = r - e;
+			const rel = e ? Math.abs(d) / e : r ? 1 : 0;
+			if (Math.abs(d) >= absMin && rel >= relMin) flags.push(`${label} ${d < 0 ? "down" : "up"}: ${r}${unit} last ${recent.games} vs ${e}${unit} before`);
+		};
+		// Snap share is already a percentage: a 15-point move matters whatever the starting level.
+		cmp("Snaps", recent.snap_pct, earlier.snap_pct, 15, "%", 0);
+		cmp("Target share", recent.tgt_share, earlier.tgt_share, 6, "%");
+		cmp("Carries", recent.carries, earlier.carries, 5);
+		cmp("Expected points", recent.xfp, earlier.xfp, 3);
+	}
+	if (projection != null && recent.xfp != null && recent.games >= 2) {
+		if (projection >= 6 && projection >= 1.75 * recent.xfp) {
+			flags.push(`Sleeper projects ${projection} this week vs ${recent.xfp} expected points per game recently: the projection assumes a bigger role than he's had.`);
+		} else if (recent.xfp >= 8 && projection > 0 && projection <= 0.55 * recent.xfp) {
+			flags.push(`Sleeper projects ${projection} this week vs ${recent.xfp} expected points per game recently: find out what Sleeper expects to change.`);
+		}
+	}
+	return flags;
+}
+
 export async function playerContext(
 	lc: LeagueContext,
 	sleeperIds: string[],
-	opts: { weeks?: number; dynasty?: boolean } = {},
+	opts: { weeks?: number; dynasty?: boolean; /** This week's Sleeper projection per player, for the projection-vs-usage flag. */ projections?: Map<string, number | null> } = {},
 ): Promise<Map<string, PlayerContext>> {
 	const out = new Map<string, PlayerContext>();
 	if (!sleeperIds.length) return out;
@@ -89,11 +142,12 @@ export async function playerContext(
 		const gsis = [...ids.values()].map((x) => x.gsis_id).filter((x): x is string => !!x);
 		const pfr = [...ids.values()].map((x) => x.pfr_id).filter((x): x is string => !!x);
 		const fp = [...ids.values()].map((x) => x.fantasypros_id).filter((x): x is string => !!x);
+		// The whole season, so the last few weeks can be compared with what came before.
 		const [stats, opp, pbp, snaps, ecr, injuries] = await Promise.all([
-			latest ? nfl.forPlayers("nfl_player_week", "gsis_id", gsis, from, latest) : [],
-			latest ? nfl.forPlayers("nfl_opportunity", "gsis_id", gsis, from, latest) : [],
+			latest ? nfl.forPlayers("nfl_player_week", "gsis_id", gsis, 1, latest) : [],
+			latest ? nfl.forPlayers("nfl_opportunity", "gsis_id", gsis, 1, latest) : [],
 			latest ? nfl.forPlayers("nfl_pbp_week", "gsis_id", gsis, from, latest) : [],
-			latest ? nfl.forPlayers("nfl_snaps", "pfr_id", pfr, from, latest) : [],
+			latest ? nfl.forPlayers("nfl_snaps", "pfr_id", pfr, 1, latest) : [],
 			nfl.ecr(fp),
 			gsis.length ? nfl.currentInjuries(`AND gsis_id IN (${gsis.map(() => "?").join(",")})`, ...gsis) : { week: 0, rows: [] as Row[], published: new Set<string>() },
 		]);
@@ -116,26 +170,19 @@ export async function playerContext(
 		for (const [sid, id] of ids) {
 			const ctx: PlayerContext = {};
 			const pos = lc.players.get(sid)?.pos;
-			const sn = id.pfr_id ? (snapsBy.get(id.pfr_id) ?? []) : [];
+			const snAll = id.pfr_id ? (snapsBy.get(id.pfr_id) ?? []) : [];
 			// Include weeks on the field with no touches (no nflverse stats row) as zero games.
-			const st = id.gsis_id ? fillPlayedWeeks(statsBy.get(id.gsis_id) ?? [], sn, id.gsis_id, nfl.season) : [];
-			if (st.length) {
-				const games = st.length;
-				const per = (rows: Row[], f: (r: Row) => number) => round(rows.reduce((a, r) => a + f(r), 0) / games, 1);
-				const o = id.gsis_id ? (oppBy.get(id.gsis_id) ?? []) : [];
-				const p = id.gsis_id ? (pbpBy.get(id.gsis_id) ?? []) : [];
-				const recent: RecentUsage = { weeks: `${from}-${latest}`, games };
-				if (sn.length) recent.snap_pct = round(mean(sn.map((r) => num(r, "offense_pct"))) * 100, 1);
-				if (pos !== "QB") {
-					recent.targets = per(st, (r) => num(r, "targets"));
-					recent.tgt_share = round(mean(st.map((r) => num(r, "target_share"))) * 100, 1);
-				}
-				if (pos === "RB" || pos === "QB") recent.carries = per(st, (r) => num(r, "carries"));
-				if (p.length) recent.rz_opps = per(p, (r) => num(r, "rz_targets") + num(r, "rz_carries"));
-				recent.pts = per(st, (r) => leaguePoints(r, scoring));
-				// Expected points per game played: a no-touch week contributes zero.
-				if (o.length) recent.xfp = round(o.reduce((a, r) => a + expectedPoints(r, scoring), 0) / Math.max(o.length, games), 1);
-				ctx.recent = recent;
+			const stAll = id.gsis_id ? fillPlayedWeeks(statsBy.get(id.gsis_id) ?? [], snAll, id.gsis_id, nfl.season) : [];
+			const oAll = id.gsis_id ? (oppBy.get(id.gsis_id) ?? []) : [];
+			const inWindow = (r: Row) => Number(r.week) >= from;
+			const before = (r: Row) => Number(r.week) < from;
+			const p = id.gsis_id ? (pbpBy.get(id.gsis_id) ?? []) : [];
+			const recentUsage = usageOver(stAll.filter(inWindow), snAll.filter(inWindow), oAll.filter(inWindow), p, pos, scoring);
+			if (recentUsage) {
+				ctx.recent = { weeks: `${from}-${latest}`, ...recentUsage };
+				const earlier = usageOver(stAll.filter(before), snAll.filter(before), oAll.filter(before), [], pos, scoring);
+				const flags = roleFlags(recentUsage, earlier, opts.projections?.get(sid) ?? null);
+				if (flags.length) ctx.role_change = flags;
 			}
 			const e = id.fantasypros_id ? ecrBy.get(id.fantasypros_id) : undefined;
 			if (e?.length) {
@@ -161,7 +208,7 @@ export async function playerContext(
 				// Teams post on different days: say when this is last week's report.
 				if (text) ctx.injury_report = Number(inj.week) === injuries.week ? text : `${text} [week ${inj.week} report; week ${injuries.week} not posted yet]`;
 			}
-			if (ctx.recent || ctx.ecr || ctx.injury_report) out.set(sid, ctx);
+			if (ctx.recent || ctx.ecr || ctx.injury_report || ctx.role_change) out.set(sid, ctx);
 		}
 	} catch (e) {
 		console.warn("nflverse context unavailable:", e instanceof Error ? e.message : e);
