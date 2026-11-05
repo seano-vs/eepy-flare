@@ -233,9 +233,23 @@ npm run deploy
 npm run seed-players          # optional: fill the remote KV now instead of on first use
 ```
 
-Your server is now at `https://eepy-flare.<your-subdomain>.workers.dev/mcp`. The cron trigger in
-`wrangler.jsonc` is deployed along with the Worker. You can check it in the dashboard under
+Your server is now at `https://eepy-flare.<your-subdomain>.workers.dev/mcp`. The cron triggers in
+`wrangler.jsonc` are deployed along with the Worker. You can check them in the dashboard under
 **Workers → eepy-flare → Settings → Triggers**.
+
+#### Or deploy from GitHub (Workers Builds)
+
+This repo is deployed by Cloudflare's Git integration: **Workers & Pages → Create → Import a
+repository**, Worker name `eepy-flare` (it must match `name` in `wrangler.jsonc`), production
+branch `main`, no build command, deploy command `npx wrangler deploy`. Every push to `main`
+deploys; other branches get preview builds.
+
+- Set secrets (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `COOKIE_ENCRYPTION_KEY`) in the
+  Worker's **Settings → Variables and Secrets** as type **Secret**. They persist across deploys.
+  Plain variables live in `wrangler.jsonc`; dashboard edits to them are overwritten on deploy.
+- If a build fails binding the D1 database with a permissions error, add **D1 Edit** to the
+  build's API token (**My Profile → API Tokens**).
+- The nflverse tables fill on the first hourly sync after deploy (at `:23`).
 
 ### 6. Add it to claude.ai
 
