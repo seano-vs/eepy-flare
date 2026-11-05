@@ -153,6 +153,12 @@ export class NflData {
 		return out;
 	}
 
+	/** Most recent FantasyPros scrape date in the mirror. */
+	async ecrDate(): Promise<string | null> {
+		const r = await this.all<{ d: string | null }>("SELECT MAX(scrape_date) AS d FROM nfl_ecr");
+		return r[0]?.d ?? null;
+	}
+
 	/** Vegas implied points per (Sleeper-style) team for a week. */
 	async impliedTotals(week: number): Promise<Map<string, number>> {
 		const out = new Map<string, number>();
@@ -208,12 +214,14 @@ export class NflData {
 	 * Current injury report rows: the latest week for teams that have published it,
 	 * otherwise that team's previous week (teams report on different days).
 	 */
-	async currentInjuries(filter = "", ...params: unknown[]): Promise<{ week: number; rows: Row[] }> {
+	async currentInjuries(filter = "", ...params: unknown[]): Promise<{ week: number; rows: Row[]; published: Set<string> }> {
 		const week = await this.latestInjuryWeek();
-		if (!week) return { week: 0, rows: [] };
+		if (!week) return { week: 0, rows: [], published: new Set() };
 		const rows = await this.weekRange("nfl_injuries", Math.max(1, week - 1), week, filter, ...params);
-		const published = new Set((await this.all<{ team: string }>("SELECT DISTINCT team FROM nfl_injuries WHERE season = ? AND week = ?", this.season, week)).map((r) => r.team));
-		return { week, rows: rows.filter((r) => (published.has(String(r.team)) ? r.week === week : r.week === week - 1)) };
+		const published = new Set(
+			(await this.all<{ team: string }>("SELECT DISTINCT team FROM nfl_injuries WHERE season = ? AND week = ?", this.season, week)).map((r) => sleeperTeam(r.team)!),
+		);
+		return { week, rows: rows.filter((r) => (published.has(sleeperTeam(r.team)!) ? r.week === week : r.week === week - 1)), published };
 	}
 
 	latestInjury(gsisIds: string[]): Promise<Row[]> {
@@ -242,6 +250,28 @@ export class NflData {
 		return computePointsAllowed(rows, scoring);
 	}
 
+	/**
+	 * Regular-season bye weeks per team (Sleeper abbreviations): weeks 1-18 with no game.
+	 * Empty when the schedule isn't loaded, so callers fall back to Sleeper's null weeks.
+	 */
+	async teamByes(): Promise<Map<string, Set<number>>> {
+		const games = await this.all("SELECT week, home_team, away_team FROM nfl_games WHERE season = ? AND game_type = 'REG'", this.season);
+		const played = new Map<string, Set<number>>();
+		for (const g of games) {
+			for (const t of [sleeperTeam(g.home_team), sleeperTeam(g.away_team)]) {
+				if (!t) continue;
+				const set = played.get(t) ?? new Set<number>();
+				set.add(Number(g.week));
+				played.set(t, set);
+			}
+		}
+		const byes = new Map<string, Set<number>>();
+		const weeks = new Set(games.map((g) => Number(g.week)));
+		if (weeks.size < 17) return byes; // schedule incomplete: don't guess
+		for (const [team, set] of played) byes.set(team, new Set([...weeks].filter((w) => !set.has(w))));
+		return byes;
+	}
+
 	/** team -> this week's opponent (Sleeper abbreviations), from the schedule. */
 	async opponents(week: number): Promise<Map<string, { opp: string; home: boolean }>> {
 		const out = new Map<string, { opp: string; home: boolean }>();
@@ -268,6 +298,24 @@ export class NflData {
 		for (const e of errors) if (!rows.some((r) => r.dataset === e.dataset)) out.push({ dataset: e.dataset, last_error: e.error, failed_at: e.failed_at, consecutive_failures: e.failures });
 		return out;
 	}
+}
+
+/**
+ * nflverse's weekly stats omit a player who was on the field but never targeted or handed
+ * the ball. Add a zero-stat row for every week he played offensive snaps without a stats row,
+ * so per-game averages divide by games actually played (otherwise a collapsing role looks
+ * better than it is). Pure; exported for tests.
+ */
+export function fillPlayedWeeks(stats: Row[], snaps: Row[], gsisId: string, season: number): Row[] {
+	const have = new Set(stats.map((r) => Number(r.week)));
+	const filled = [...stats];
+	for (const s of snaps) {
+		const w = Number(s.week);
+		if (have.has(w) || !(typeof s.offense_snaps === "number" && s.offense_snaps > 0)) continue;
+		have.add(w);
+		filled.push({ season, week: w, gsis_id: gsisId, name: s.name, position: s.position, team: s.team, opp: s.opp, filled_from_snaps: true });
+	}
+	return filled.sort((a, b) => Number(a.week) - Number(b.week));
 }
 
 export type PointsAllowed = Map<string, Map<string, { ppg: number; games: number; rank: number }>>;

@@ -4,7 +4,7 @@
 
 import type { LeagueContext } from "../league";
 import { round } from "../scoring";
-import { NflData, expectedPoints, leaguePoints } from "./stats";
+import { NflData, expectedPoints, fillPlayedWeeks, leaguePoints } from "./stats";
 
 type Row = Record<string, unknown>;
 
@@ -59,6 +59,20 @@ export function describeInjury(r: Row): string | undefined {
 	return out || undefined;
 }
 
+const UNAVAILABLE_TAG = /^(IR|Out|Doubtful|PUP|Sus|NA|DNR|COV)$/i;
+
+/**
+ * True when a player can't be counted on this week: Sleeper's tag says Out/Doubtful/IR/PUP/
+ * suspended (or a non-Active roster status), or the current official report lists him Out or
+ * Doubtful. Waiver lists hide these by default, because their recent usage predates the injury.
+ */
+export function isUnavailable(p: { injury?: string; status?: string } | undefined, reportStatus?: unknown): boolean {
+	if (!p) return false;
+	if (UNAVAILABLE_TAG.test(p.injury ?? "")) return true;
+	if (p.status && p.status !== "Active") return true;
+	return typeof reportStatus === "string" && /^(Out|Doubtful)$/i.test(reportStatus);
+}
+
 export async function playerContext(
 	lc: LeagueContext,
 	sleeperIds: string[],
@@ -81,7 +95,7 @@ export async function playerContext(
 			latest ? nfl.forPlayers("nfl_pbp_week", "gsis_id", gsis, from, latest) : [],
 			latest ? nfl.forPlayers("nfl_snaps", "pfr_id", pfr, from, latest) : [],
 			nfl.ecr(fp),
-			gsis.length ? nfl.currentInjuries(`AND gsis_id IN (${gsis.map(() => "?").join(",")})`, ...gsis).then((x) => x.rows) : [],
+			gsis.length ? nfl.currentInjuries(`AND gsis_id IN (${gsis.map(() => "?").join(",")})`, ...gsis) : { week: 0, rows: [] as Row[], published: new Set<string>() },
 		]);
 		const group = (rows: Row[], col: string) => {
 			const m = new Map<string, Row[]>();
@@ -96,19 +110,20 @@ export async function playerContext(
 		const pbpBy = group(pbp, "gsis_id");
 		const snapsBy = group(snaps, "pfr_id");
 		const ecrBy = group(ecr, "fantasypros_id");
-		const injBy = new Map(injuries.map((r) => [String(r.gsis_id), r]));
+		const injBy = new Map(injuries.rows.map((r) => [String(r.gsis_id), r]));
 		const scoring = lc.league.scoring_settings;
 
 		for (const [sid, id] of ids) {
 			const ctx: PlayerContext = {};
 			const pos = lc.players.get(sid)?.pos;
-			const st = id.gsis_id ? (statsBy.get(id.gsis_id) ?? []) : [];
+			const sn = id.pfr_id ? (snapsBy.get(id.pfr_id) ?? []) : [];
+			// Include weeks on the field with no touches (no nflverse stats row) as zero games.
+			const st = id.gsis_id ? fillPlayedWeeks(statsBy.get(id.gsis_id) ?? [], sn, id.gsis_id, nfl.season) : [];
 			if (st.length) {
 				const games = st.length;
 				const per = (rows: Row[], f: (r: Row) => number) => round(rows.reduce((a, r) => a + f(r), 0) / games, 1);
 				const o = id.gsis_id ? (oppBy.get(id.gsis_id) ?? []) : [];
 				const p = id.gsis_id ? (pbpBy.get(id.gsis_id) ?? []) : [];
-				const sn = id.pfr_id ? (snapsBy.get(id.pfr_id) ?? []) : [];
 				const recent: RecentUsage = { weeks: `${from}-${latest}`, games };
 				if (sn.length) recent.snap_pct = round(mean(sn.map((r) => num(r, "offense_pct"))) * 100, 1);
 				if (pos !== "QB") {
@@ -118,7 +133,8 @@ export async function playerContext(
 				if (pos === "RB" || pos === "QB") recent.carries = per(st, (r) => num(r, "carries"));
 				if (p.length) recent.rz_opps = per(p, (r) => num(r, "rz_targets") + num(r, "rz_carries"));
 				recent.pts = per(st, (r) => leaguePoints(r, scoring));
-				if (o.length) recent.xfp = round(o.reduce((a, r) => a + expectedPoints(r, scoring), 0) / o.length, 1);
+				// Expected points per game played: a no-touch week contributes zero.
+				if (o.length) recent.xfp = round(o.reduce((a, r) => a + expectedPoints(r, scoring), 0) / Math.max(o.length, games), 1);
 				ctx.recent = recent;
 			}
 			const e = id.fantasypros_id ? ecrBy.get(id.fantasypros_id) : undefined;
@@ -140,7 +156,11 @@ export async function playerContext(
 				ctx.ecr = c;
 			}
 			const inj = id.gsis_id ? injBy.get(id.gsis_id) : undefined;
-			if (inj) ctx.injury_report = describeInjury(inj);
+			if (inj) {
+				const text = describeInjury(inj);
+				// Teams post on different days: say when this is last week's report.
+				if (text) ctx.injury_report = Number(inj.week) === injuries.week ? text : `${text} [week ${inj.week} report; week ${injuries.week} not posted yet]`;
+			}
 			if (ctx.recent || ctx.ecr || ctx.injury_report) out.set(sid, ctx);
 		}
 	} catch (e) {
@@ -175,6 +195,25 @@ export async function matchups(lc: LeagueContext, week: number): Promise<(team: 
 		};
 	} catch {
 		return () => undefined;
+	}
+}
+
+/** Which teams have posted the current week's injury report. Null when unavailable. */
+export async function injuryReportState(lc: LeagueContext): Promise<{ week: number; published: Set<string> } | null> {
+	try {
+		const cur = await NflData.from(lc.env, lc.season).currentInjuries("AND 0");
+		return cur.week ? { week: cur.week, published: cur.published } : null;
+	} catch {
+		return null;
+	}
+}
+
+/** team -> bye weeks from the schedule; empty map (fall back to Sleeper) when unavailable. */
+export async function teamByes(lc: LeagueContext): Promise<Map<string, Set<number>>> {
+	try {
+		return await NflData.from(lc.env, lc.season).teamByes();
+	} catch {
+		return new Map();
 	}
 }
 

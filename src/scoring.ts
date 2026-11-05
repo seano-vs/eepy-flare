@@ -199,6 +199,9 @@ const BULK_TTL_S = 6 * 60 * 60;
  * Cached in KV (6h) because the upstream response is ~2 MB.
  * Returns [] if the undocumented endpoint fails or changes shape.
  */
+/** When each weekly pool was fetched from Sleeper (ISO), keyed `${season}:${week}`; for freshness reporting. */
+export const poolFetchedAt = new Map<string, string>();
+
 export async function weekPool(
 	kv: KVNamespace,
 	league: League,
@@ -206,14 +209,13 @@ export async function weekPool(
 	week: number,
 	seasonType = "regular",
 ): Promise<ProjectedEntry[]> {
-	const key = `proj:v2:${league.league_id}:${season}:${seasonType}:${week}:${scoringHash(league.scoring_settings)}`;
+	const key = `proj:v3:${league.league_id}:${season}:${seasonType}:${week}:${scoringHash(league.scoring_settings)}`;
 	const memo = bulkMemo.get(key);
 	if (memo && Date.now() - memo.at < 10 * 60 * 1000) return memo.entries;
 
-	let entries: ProjectedEntry[] | null = await kv.get<[string, string, number, string | null][]>(key, "json").then(
-		(rows) => rows?.map(([id, pos, pts, opp]): ProjectedEntry => ({ id, pos, pts, opp })) ?? null,
-		() => null,
-	);
+	const cached = await kv.get<{ at: string; rows: [string, string, number, string | null][] }>(key, "json").catch(() => null);
+	let entries: ProjectedEntry[] | null = cached?.rows?.map(([id, pos, pts, opp]): ProjectedEntry => ({ id, pos, pts, opp })) ?? null;
+	if (cached?.at) poolFetchedAt.set(`${season}:${week}`, cached.at);
 	if (!entries) {
 		try {
 			const raw = await sleeper.weekProjections(season, week, seasonType, PROJECTED_POSITIONS);
@@ -222,8 +224,10 @@ export async function weekPool(
 			entries = [];
 		}
 		if (entries.length > 0) {
+			const at = new Date().toISOString();
+			poolFetchedAt.set(`${season}:${week}`, at);
 			const rows = entries.map((e) => [e.id, e.pos, e.pts, e.opp ?? null]);
-			await kv.put(key, JSON.stringify(rows), { expirationTtl: BULK_TTL_S }).catch(() => {});
+			await kv.put(key, JSON.stringify({ at, rows }), { expirationTtl: BULK_TTL_S }).catch(() => {});
 		}
 	}
 	if (bulkMemo.size > 50) bulkMemo.clear();
@@ -263,6 +267,7 @@ export interface PlayerValuation {
 	/** Actual points so far this season under league scoring. */
 	season_pts?: number;
 	season_games?: number;
+	season_ppg?: number;
 	weeks?: { week: number; opp: string | null; pts: number }[];
 	key_stats?: Record<string, number>;
 	/** Projection assumptions to check against current news before relying on them. */
@@ -289,12 +294,21 @@ export function summarizeWeeks(
 	throughWeek: number,
 	scoring: Record<string, number>,
 	replacement: number,
+	/**
+	 * Weeks the player's team has no game, from the NFL schedule. Sleeper also returns null for a
+	 * player it expects to sit, so with a schedule a null week is a bye only when the team is idle.
+	 */
+	teamByes?: Set<number>,
 ): WeekSummary {
 	const s: WeekSummary = { perWeek: [], byeWeeks: [], outWeeks: [], ros: 0, vor: 0 };
 	for (let w = fromWeek; w <= throughWeek; w++) {
+		if (teamByes?.has(w)) {
+			s.byeWeeks.push(w);
+			continue;
+		}
 		if (!weeks.has(w)) continue;
 		const wp = weeks.get(w);
-		if (wp === null) {
+		if (wp === null && !teamByes) {
 			s.byeWeeks.push(w);
 			continue;
 		}
@@ -339,6 +353,8 @@ export async function valuePlayer(opts: {
 	/** Sleeper injury_status and non-Active roster status, used for the verify notes. */
 	injury?: string;
 	status?: string;
+	/** Team bye weeks from the NFL schedule (see summarizeWeeks). */
+	teamByes?: Set<number>;
 }): Promise<PlayerValuation | null> {
 	const [projRaw, statsRaw] = await Promise.all([
 		sleeper.playerProjections(opts.playerId, opts.season, opts.seasonType).catch(() => null),
@@ -349,7 +365,7 @@ export async function valuePlayer(opts: {
 
 	const scoring = opts.league.scoring_settings;
 	const repl = opts.replacement?.level[opts.pos as SkillPos] ?? 0;
-	const sum = summarizeWeeks(weeks, opts.week, opts.throughWeek, scoring, repl);
+	const sum = summarizeWeeks(weeks, opts.week, opts.throughWeek, scoring, repl, opts.teamByes);
 	const current = weeks.get(opts.week) ?? null;
 	const playsNow = current && plays(current.stats);
 	const v: PlayerValuation = {
@@ -374,6 +390,7 @@ export async function valuePlayer(opts: {
 	if (statsRaw) {
 		v.season_pts = round(seasonPts, 1);
 		v.season_games = seasonGames;
+		if (seasonGames) v.season_ppg = round(seasonPts / seasonGames, 1);
 	}
 
 	if (opts.includeWeeks) v.weeks = sum.perWeek;

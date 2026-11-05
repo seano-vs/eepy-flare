@@ -45,13 +45,18 @@ export function parseAdp(data: unknown, field: string): Record<string, number> {
 const memo = new Map<string, { at: number; adp: Record<string, number> }>();
 
 /** id → dynasty ADP, cached in KV for 12h (the upstream response is ~3 MB). Empty on failure. */
+/** When the dynasty ADP was last fetched from Sleeper (ISO), for freshness reporting. */
+export let adpFetchedAt: string | null = null;
+
 export async function dynastyAdp(kv: KVNamespace, league: League): Promise<Record<string, number>> {
 	const field = adpField(league);
-	const key = `adp:v1:${league.season}:${field}`;
+	const key = `adp:v2:${league.season}:${field}`;
 	const hit = memo.get(key);
 	if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.adp;
 
-	let adp = await kv.get<Record<string, number>>(key, "json").catch(() => null);
+	const cached = await kv.get<{ at: string; adp: Record<string, number> }>(key, "json").catch(() => null);
+	let adp = cached?.adp ?? null;
+	if (cached?.at) adpFetchedAt = cached.at;
 	if (!adp) {
 		try {
 			adp = parseAdp(await sleeper.seasonProjections(league.season, "regular", PROJECTED_POSITIONS), field);
@@ -59,7 +64,8 @@ export async function dynastyAdp(kv: KVNamespace, league: League): Promise<Recor
 			adp = {};
 		}
 		if (Object.keys(adp).length > 0) {
-			await kv.put(key, JSON.stringify(adp), { expirationTtl: 12 * 60 * 60 }).catch(() => {});
+			adpFetchedAt = new Date().toISOString();
+			await kv.put(key, JSON.stringify({ at: adpFetchedAt, adp }), { expirationTtl: 12 * 60 * 60 }).catch(() => {});
 		}
 	}
 	memo.set(key, { at: Date.now(), adp });

@@ -4,8 +4,10 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { LeagueContext } from "./league";
-import { NflData, expectedPoints, leaguePoints, sleeperTeam, unmappedRules } from "./nflverse/stats";
-import { describeInjury } from "./nflverse/context";
+import { NflData, expectedPoints, fillPlayedWeeks, leaguePoints, sleeperTeam, unmappedRules } from "./nflverse/stats";
+import { describeInjury, isUnavailable, weeklyStale } from "./nflverse/context";
+import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
+import { poolFetchedAt, weekPool } from "./scoring";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { round } from "./scoring";
 
@@ -71,13 +73,15 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						continue;
 					}
 					const ngsTable = p.pos === "QB" ? "nfl_ngs_passing" : p.pos === "RB" ? "nfl_ngs_rushing" : "nfl_ngs_receiving";
-					const [stats, opp, snaps, pbp, ngs] = await Promise.all([
+					const [statsRaw, opp, snaps, pbp, ngs] = await Promise.all([
 						nfl.byPlayer("nfl_player_week", "gsis_id", id.gsis_id, from, latest),
 						nfl.byPlayer("nfl_opportunity", "gsis_id", id.gsis_id, from, latest),
 						id.pfr_id ? nfl.byPlayer("nfl_snaps", "pfr_id", id.pfr_id, from, latest) : Promise.resolve([] as Row[]),
 						nfl.byPlayer("nfl_pbp_week", "gsis_id", id.gsis_id, from, latest),
 						nfl.byPlayer(ngsTable, "gsis_id", id.gsis_id, from, latest),
 					]);
+					// Weeks on the field without a target or carry have no stats row upstream: count them as zeros.
+					const stats = fillPlayedWeeks(statsRaw, snaps, id.gsis_id, nfl.season);
 					const oppBy = new Map(opp.map((r) => [r.week as number, r]));
 					const snapBy = new Map(snaps.map((r) => [r.week as number, r]));
 					const pbpBy = new Map(pbp.map((r) => [r.week as number, r]));
@@ -87,11 +91,13 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						const o = oppBy.get(w);
 						const s = snapBy.get(w);
 						const pts = leaguePoints(r, scoring);
-						const xfp = o ? expectedPoints(o, scoring) : null;
+						// A filled week had no opportunities, so its expected points are zero too.
+						const xfp = o ? expectedPoints(o, scoring) : r.filled_from_snaps ? 0 : null;
 						const pb = pbpBy.get(w);
 						return {
 							week: w,
 							opp: sleeperTeam(r.opp),
+							...(r.filled_from_snaps ? { no_touches: true } : {}),
 							...(s ? { snap_pct: pct(num(s, "offense_pct")) } : {}),
 							...(isQb
 								? {
@@ -132,7 +138,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 							carries: per("carries"),
 							...rzTotals,
 							pts: per("pts"),
-							...(opp.length ? { xfp: per("xfp"), diff: per("diff") } : {}),
+							...(opp.length || rows.some((x) => "xfp" in x) ? { xfp: per("xfp"), diff: per("diff") } : {}),
 						},
 						...(ngs.length ? { next_gen: nextGen(ngs, p.pos) } : {}),
 						...(inj ? { injury_report: `${describeInjury(inj) ?? "On report"} (week ${inj.week})` } : {}),
@@ -145,7 +151,8 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					note:
 						"pts = this league's scoring applied to nflverse box scores. xfp = expected points for the same usage (ffopportunity model), re-scored for this league; diff = pts - xfp (negative = unlucky). " +
 						"Red zone from play-by-play: rz_tgt/rz_car inside the 20 (with share of team), ez_tgt = targets at or past the goal line, gl_car = carries inside the 5, deep_tgt = 20+ air yards. " +
-						"next_gen = NFL Next Gen Stats averages over the weeks the player qualified." +
+						"next_gen = NFL Next Gen Stats averages over the weeks the player qualified. " +
+						"no_touches = he played offensive snaps but had no target or carry (nflverse omits those weeks; they count as zeros here)." +
 						(gaps.length ? ` Not reproduced: ${gaps.join(", ")}.` : ""),
 				});
 			} catch (e) {
@@ -161,17 +168,18 @@ export function registerNflTools(server: McpServer, env: Env): void {
 			title: "Opportunity leaders",
 			description:
 				"Rank players by usage or expected fantasy points over recent weeks (nflverse + ffopportunity, scored for this league). " +
-				"Use available_only for waiver targets; sort buy_low (scoring well below expected) or sell_high (well above expected) for trade targets.",
+				"Use available_only for waiver targets (players listed Out, Doubtful, IR or suspended are hidden unless include_injured); sort buy_low (scoring well below expected) or sell_high (well above expected) for trade targets, or red_zone for touchdown equity.",
 			inputSchema: z.object({
 				position: z.enum(["QB", "RB", "WR", "TE"]).optional(),
 				weeks: z.number().int().min(1).max(18).optional().describe("Recent weeks to aggregate (default 3)."),
 				sort: z.enum(SORTS).optional().describe("Default xfp (expected points per game)."),
 				available_only: z.boolean().optional().describe("Only players not on a roster in this league."),
+				include_injured: z.boolean().optional().describe("With available_only, keep players listed Out/Doubtful/IR/suspended (default false)."),
 				limit: z.number().int().min(1).max(50).optional().describe("Default 15."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ position, weeks, sort, available_only, limit }) => {
+		async ({ position, weeks, sort, available_only, include_injured, limit }) => {
 			try {
 				const { lc, nfl } = await load();
 				const latest = await nfl.latestWeek();
@@ -214,11 +222,20 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				}
 				const gsisOfSleeper = maps.bySleeper;
 				const sleeperOfGsis = maps.byGsis;
+				const statWeeks = new Set(stats.map((r) => `${r.gsis_id}|${r.week}`));
 				for (const s of snaps) {
 					const sid = maps.byPfr.get(String(s.pfr_id));
 					const g = sid ? gsisOfSleeper.get(sid) : undefined;
 					const a = g ? agg.get(g) : undefined;
-					if (a) a.snap.push(num(s, "offense_pct"));
+					if (!a) continue;
+					a.snap.push(num(s, "offense_pct"));
+					// On the field with no touches: nflverse has no stats row, so count a zero game.
+					if (num(s, "offense_snaps") > 0 && !statWeeks.has(`${g}|${s.week}`)) {
+						a.games++;
+						a.share.push(0);
+						a.wopr.push(0);
+						a.oppGames++;
+					}
 				}
 				const owned = lc.ownership();
 				const minGames = Math.min(2, span);
@@ -244,7 +261,14 @@ export function registerNflTools(server: McpServer, env: Env): void {
 							...(xpg != null ? { xfp: round(xpg, 1), diff: round(ppg - xpg, 1) } : {}),
 						};
 					});
-				if (available_only) rows = rows.filter((r) => r.league_status === "available");
+				if (available_only) {
+					rows = rows.filter((r) => r.league_status === "available");
+					if (!include_injured) {
+						const cur = await nfl.currentInjuries();
+						const report = new Map(cur.rows.map((r) => [maps.byGsis.get(String(r.gsis_id)), r.report_status]));
+						rows = rows.filter((r) => !isUnavailable(r.sid ? lc.players.get(r.sid) : undefined, r.sid ? report.get(r.sid) : undefined));
+					}
+				}
 				const key = sort ?? "xfp";
 				const val = (r: (typeof rows)[number]): number => {
 					const x = r as unknown as Row;
@@ -461,18 +485,39 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		"get_nfl_data_status",
 		{
 			title: "NFL data freshness",
-			description: "When each nflverse dataset mirrored by this server was last checked and last changed, any sync errors, and the latest week with stats.",
+			description:
+				"Data freshness in one place: each nflverse dataset's last check/change and any sync errors, the latest week with stats, when Sleeper's players cache (injury tags), projections and ADP were fetched, the FantasyPros rankings date, and which teams have posted this week's injury report.",
 			inputSchema: z.object({}),
 			annotations: READ_ONLY,
 		},
 		async () => {
 			try {
-				const { nfl } = await load();
+				const { lc, nfl } = await load();
 				const [status, latest] = await Promise.all([nfl.status(), nfl.latestWeek()]);
+				// Freshness of the Sleeper-side caches, which aren't part of the nflverse sync.
+				await weekPool(env.PLAYERS, lc.league, lc.season, lc.week, lc.seasonType).catch(() => []);
+				if (isDynasty(lc.league)) await dynastyAdp(env.PLAYERS, lc.league).catch(() => ({}));
+				const ecrRow = (await nfl.ecrDate().catch(() => null)) ?? null;
+				const reports = await nfl.currentInjuries("AND 0").catch(() => null);
+				const allTeams = new Set([...(await nfl.opponents(lc.week).catch(() => new Map())).keys()]);
 				const failing = status.filter((r) => r.last_error).map((r) => r.dataset);
 				return ok({
+					checked_at: new Date().toISOString(),
 					latest_stats_week: latest,
 					...(failing.length ? { failing } : { healthy: true }),
+					sleeper: {
+						players_cache: lc.players.updated,
+						projections_week: lc.week,
+						projections_fetched_at: poolFetchedAt.get(`${lc.season}:${lc.week}`) ?? null,
+						...(isDynasty(lc.league) ? { dynasty_adp_fetched_at: adpFetchedAt } : {}),
+						note: "Players cache (injury tags) refreshes daily at 09:17 UTC; projections are cached up to 6 hours, ADP 12 hours.",
+					},
+					...(ecrRow
+						? { fantasypros: { scraped: ecrRow, weekly_ranks_current: !weeklyStale(ecrRow), note: "Weekly ranks are hidden once a new NFL week starts until FantasyPros publishes the next scrape." } }
+						: {}),
+					...(reports?.week
+						? { injury_reports: { week: reports.week, posted: reports.published.size, not_posted: [...allTeams].filter((t) => !reports.published.has(t)).sort() } }
+						: {}),
 					datasets: status,
 					refresh: "hourly; files are only downloaded when they change upstream. A failing dataset keeps its last good data.",
 				});

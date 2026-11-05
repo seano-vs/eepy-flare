@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { LeagueContext } from "./league";
 import {
+	poolFetchedAt,
 	computeReplacement,
 	lastFantasyWeek,
 	optimalLineup,
@@ -14,7 +15,7 @@ import {
 } from "./scoring";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { READ_ONLY, fail, fmt, ok } from "./result";
-import { impliedTotals, matchups, playerContext, type PlayerContext } from "./nflverse/context";
+import { impliedTotals, injuryReportState, matchups, matchups as matchups_, playerContext, teamByes, type PlayerContext } from "./nflverse/context";
 import { registerNflTools } from "./nfl-tools";
 import { pickSchema, registerAdvisorTools, valuePicks } from "./advisor";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
@@ -164,11 +165,12 @@ export function createServer(env: Env): McpServer {
 				const lc = await ctx();
 				const r = lc.myRoster();
 				const w = week ?? lc.week;
-				const [poolArr, nflCtx, implied, matchup] = await Promise.all([
+				const [poolArr, nflCtx, implied, matchup, reports] = await Promise.all([
 					weekPool(env.PLAYERS, lc.league, lc.season, w, lc.seasonType),
 					playerContext(lc, r.players ?? [], { dynasty: isDynasty(lc.league) }),
 					impliedTotals(lc, w),
 					matchups(lc, w),
+					injuryReportState(lc),
 				]);
 				const pool = poolMap(poolArr);
 				const proj = (id: string) => pool.get(id)?.pts ?? (pool.size ? 0 : null);
@@ -178,6 +180,8 @@ export function createServer(env: Env): McpServer {
 					const pl = lc.players.get(id);
 					const team = pl?.team;
 					const m = matchup(team, pl?.pos);
+					const projection = proj(id);
+					const verify = zeroProjectionNote(projection, !!m, pl?.injury ?? pl?.status, c?.injury_report);
 					return {
 						...(m ? { vs: `${m.home ? "" : "@"}${m.opp}`, ...(m.def_rank ? { def_rank: m.def_rank } : {}) } : team && implied.size ? { vs: "BYE" } : {}),
 						...(c?.ecr?.week ? { ecr: c.ecr.week } : {}),
@@ -185,6 +189,7 @@ export function createServer(env: Env): McpServer {
 						...(c?.injury_report ? { injury_report: c.injury_report } : {}),
 						...(team && implied.has(team) ? { implied: implied.get(team) } : {}),
 						...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
+						...(verify ? { verify } : {}),
 					};
 				};
 
@@ -212,6 +217,15 @@ export function createServer(env: Env): McpServer {
 				if (r.reserve?.length) out.ir = r.reserve.map((id) => fmt(lc.ref(id)));
 				if (r.taxi?.length) out.taxi = r.taxi.map((id) => fmt(lc.ref(id)));
 				if (nflCtx.size) out.legend = CONTEXT_LEGEND;
+				// A player with no report row isn't necessarily healthy if his team hasn't posted yet.
+				if (reports && w === lc.week) {
+					const myTeams = new Set((r.players ?? []).map((id) => lc.players.get(id)?.team).filter((t): t is string => !!t && !!matchup(t, undefined)));
+					const pending = [...myTeams].filter((t) => !reports.published.has(t)).sort();
+					if (pending.length) out.injury_reports_not_posted = { week: reports.week, teams: pending, note: "No row for these teams' players doesn't mean healthy; their report isn't in yet." };
+				}
+				out.fetched_at = new Date().toISOString();
+				const pf = poolFetchedAt.get(`${lc.season}:${w}`);
+				if (pf) out.projections_fetched_at = pf;
 
 				if (pool.size) {
 					const active = (r.players ?? []).filter((id) => !reserve.has(id));
@@ -260,9 +274,10 @@ export function createServer(env: Env): McpServer {
 			try {
 				const lc = await ctx();
 				const w = week ?? lc.week;
-				const [matchups, poolArr] = await Promise.all([
+				const [matchups, poolArr, games] = await Promise.all([
 					sleeper.matchups(lc.config.leagueId, w),
 					w >= lc.week ? weekPool(env.PLAYERS, lc.league, lc.season, w, lc.seasonType) : Promise.resolve([]),
+					w >= lc.week ? matchups_(lc, w) : Promise.resolve(() => undefined),
 				]);
 				if (!matchups?.length) return ok({ week: w, matchups: [], note: "No matchups for this week." });
 				const pool = poolMap(poolArr);
@@ -282,12 +297,18 @@ export function createServer(env: Env): McpServer {
 					};
 					if (!detail) return base;
 					const pp = m.players_points ?? {};
-					base.starters = starters.map((id, i) => ({
-						slot: slots[i] ?? "?",
-						player: fmt(lc.ref(id)),
-						pts: m.starters_points?.[i] ?? pp[id] ?? 0,
-						...(pool.size && id !== "0" ? { proj: pool.get(id)?.pts ?? 0 } : {}),
-					}));
+					base.starters = starters.map((id, i) => {
+						const pl = lc.players.get(id);
+						const proj = pool.size && id !== "0" ? (pool.get(id)?.pts ?? 0) : undefined;
+						const verify = proj != null ? zeroProjectionNote(proj, !!games(pl?.team, pl?.pos), pl?.injury ?? pl?.status, undefined) : undefined;
+						return {
+							slot: slots[i] ?? "?",
+							player: fmt(lc.ref(id)),
+							pts: m.starters_points?.[i] ?? pp[id] ?? 0,
+							...(proj != null ? { proj } : {}),
+							...(verify ? { verify } : {}),
+						};
+					});
 					const st = new Set(starters);
 					base.bench = (m.players ?? [])
 						.filter((id) => !st.has(id))
@@ -506,6 +527,7 @@ export function createServer(env: Env): McpServer {
 		const ranks = positionRanks(pool);
 		const players = queries.map((q) => lc.players.resolve(q));
 		const nflCtxP = playerContext(lc, players.map((p) => p.id), { dynasty });
+		const byes = await teamByes(lc);
 		const vals = await Promise.all(
 			players.map((p) =>
 				valuePlayer({
@@ -520,6 +542,7 @@ export function createServer(env: Env): McpServer {
 					includeWeeks,
 					injury: p.injury,
 					status: p.status,
+					...(p.team && byes.has(p.team) ? { teamByes: byes.get(p.team) } : {}),
 				}),
 			),
 		);
@@ -831,4 +854,16 @@ const CONTEXT_LEGEND =
 	"vs = this week's opponent (@ = away, BYE = no game); def_rank = that defense's rank in points allowed to the player's position this season (1 = most allowed, best matchup; 32 = toughest). implied = team's Vegas implied points. " +
 	"recent = per-game over the last 3 weeks with stats: snap %, targets and target share, carries, rz_opps (red-zone targets + carries), " +
 	"pts under league scoring and xfp (expected points for that usage). injury_report = official report: status (injury), practice.";
+
+/**
+ * A projection of 0 for a player whose team plays this week needs a reason before anyone
+ * relies on it: Sleeper's projections lag announcements and sometimes assume unannounced
+ * benchings. Returns a note, or undefined when nothing needs checking.
+ */
+export function zeroProjectionNote(proj: number | null, hasGame: boolean, tag: string | undefined, report: string | undefined): string | undefined {
+	if (proj !== 0 || !hasGame) return undefined;
+	if (report) return `Projected 0 with a game this week. Official report: ${report}. Confirm he's ruled out before benching or dropping.`;
+	if (tag) return `Projected 0 with a game this week; listed ${tag}. Confirm his status in current news.`;
+	return "Projected 0 with a game this week and no injury or status listed. Sleeper doesn't say why (injury news, benching, depth chart?), so find a dated source before relying on it.";
+}
 

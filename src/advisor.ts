@@ -5,7 +5,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { LeagueContext } from "./league";
-import { playerContext } from "./nflverse/context";
+import { isUnavailable, playerContext } from "./nflverse/context";
 import { NflData, expectedPoints } from "./nflverse/stats";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { computeReplacement, lastFantasyWeek, optimalLineup, round, weekPool, type SkillPos } from "./scoring";
@@ -111,8 +111,10 @@ async function leagueClaims(lc: LeagueContext): Promise<Claim[]> {
 export interface TradeAsset {
 	id: string;
 	pos: string;
-	/** Projected league points per game over the next few weeks (0 if none). */
+	/** Projected league points per game over the next few weeks, in weeks he's projected to play (0 if none). */
 	ppg: number;
+	/** How many of those weeks he's projected to play. */
+	games: number;
 	/** Rest-of-season value over replacement. */
 	ros_vor: number;
 	dynasty_value: number;
@@ -135,9 +137,11 @@ async function nearTermPpg(lc: LeagueContext, fromWeek: number, n: number) {
 			acc.set(e.id, a);
 		}
 	}
-	const ppg = new Map<string, { pos: string; pts: number }>();
-	for (const [id, a] of acc) ppg.set(id, { pos: a.pos, pts: round(a.sum / a.games, 2) });
-	return { ppg, current: pools[0] ?? [] };
+	const ppg = new Map<string, { pos: string; pts: number; games: number }>();
+	for (const [id, a] of acc) ppg.set(id, { pos: a.pos, pts: round(a.sum / a.games, 2), games: a.games });
+	// Per-week maps, so lineups can be scored week by week (a bye or projected absence counts as 0).
+	const byWeek = pools.map((pool) => new Map(pool.map((e) => [e.id, { pos: e.pos, pts: e.pts }])));
+	return { ppg, current: pools[0] ?? [], weeks, byWeek };
 }
 
 // ================================================================ draft picks
@@ -261,10 +265,11 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				player: z.string().optional().describe("Target player (name or Sleeper id). Omit for top available targets."),
 				position: z.enum(["QB", "RB", "WR", "TE"]).optional(),
 				limit: z.number().int().min(1).max(15).optional().describe("Targets when no player is given (default 8)."),
+				include_injured: z.boolean().optional().describe("Keep players listed Out/Doubtful/IR/suspended in the target list (default false)."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ player, position, limit }) => {
+		async ({ player, position, limit, include_injured }) => {
 			try {
 				const lc = await LeagueContext.load(env);
 				if (lc.league.settings.waiver_type !== 2) return ok({ note: "This league doesn't use FAAB." });
@@ -314,6 +319,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 
 				const owned = lc.ownership();
 				const from = Math.max(1, latest - 2);
+				const report = new Map((await nfl.currentInjuries()).rows.map((r) => [maps.byGsis.get(String(r.gsis_id)), r.report_status]));
 				let targets: string[];
 				if (player) {
 					targets = [lc.players.resolve(player).id];
@@ -323,7 +329,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						.filter((sid) => {
 							const p = lc.players.get(sid);
 							// Skip players who can't help soon: their recent usage predates the injury.
-							const unavailable = /^(IR|Out|PUP|Sus|NA|DNR|COV)$/i.test(p?.injury ?? "") || (p?.status && p.status !== "Active");
+							const unavailable = !include_injured && isUnavailable(p, report.get(sid));
 							return p && !unavailable && ["QB", "RB", "WR", "TE"].includes(p.pos) && (!position || p.pos === position);
 						})
 						.map((sid) => ({ sid, x: xfpWindow(sid, from, latest) ?? 0 }))
@@ -391,21 +397,21 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const slots = lc.league.roster_positions.filter((s) => s !== "BN");
 				const through = Math.max(lc.week, lastFantasyWeek(lc.league));
 				const weeksLeft = Math.max(1, through - lc.week + 1);
-				const [{ ppg, current }, adp] = await Promise.all([nearTermPpg(lc, lc.week, 3), dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>)]);
+				const [{ ppg, current, weeks: window, byWeek }, adp] = await Promise.all([nearTermPpg(lc, lc.week, 3), dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>)]);
 				const repl = current.length ? computeReplacement(current, lc.league.roster_positions, lc.league.total_rosters) : null;
-				const ptsMap = new Map<string, { pos: string; pts: number }>([...ppg].map(([id, v]) => [id, v]));
 
 				const asset = (id: string): TradeAsset => {
 					const p = ppg.get(id);
 					const pos = p?.pos ?? lc.players.get(id)?.pos ?? "?";
 					const r = repl?.level[pos as SkillPos] ?? 0;
-					return { id, pos, ppg: p?.pts ?? 0, ros_vor: round(Math.max(0, (p?.pts ?? 0) - r) * weeksLeft, 1), dynasty_value: dynasty ? dynastyValue(adp[id]) : 0 };
+					return { id, pos, ppg: p?.pts ?? 0, games: p?.games ?? 0, ros_vor: round(Math.max(0, (p?.pts ?? 0) - r) * weeksLeft, 1), dynasty_value: dynasty ? dynastyValue(adp[id]) : 0 };
 				};
 				const active = (r: Roster) => {
 					const res = new Set([...(r.reserve ?? []), ...(r.taxi ?? [])]);
 					return (r.players ?? []).filter((id) => !res.has(id) && ["QB", "RB", "WR", "TE"].includes(lc.players.get(id)?.pos ?? ""));
 				};
-				const lineup = (ids: string[]) => optimalLineup(ids, slots, ptsMap).total;
+				// Average of each window week's best lineup: a player out or on bye that week adds nothing.
+				const lineup = (ids: string[]) => (byWeek.length ? byWeek.reduce((a, m) => a + optimalLineup(ids, slots, m).total, 0) / byWeek.length : 0);
 				// One number per trade side, blending the two lenses by focus.
 				const worth = (a: TradeAsset[]) => {
 					const vor = a.reduce((s, x) => s + x.ros_vor, 0);
@@ -456,10 +462,23 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					seen.add(k);
 					return true;
 				});
-				const side = (ids: string[]) => ids.map((id) => ({ player: fmt(lc.ref(id)), ...(() => { const a = asset(id); return { ppg: a.ppg, ros_vor: a.ros_vor, ...(dynasty ? { dynasty_value: a.dynasty_value } : {}) }; })() }));
+				const windowLabel = window.length ? `${window[0]}-${window[window.length - 1]}` : "";
+				const side = (ids: string[]) =>
+					ids.map((id) => {
+						const a = asset(id);
+						return {
+							player: fmt(lc.ref(id)),
+							// Sleeper projection per game in weeks he's projected to play, over the next 3 weeks.
+							proj_ppg_next3: a.ppg,
+							games_next3: `${a.games}/${window.length}`,
+							ros_vor: a.ros_vor,
+							...(dynasty ? { dynasty_value: a.dynasty_value } : {}),
+						};
+					});
 				return ok({
 					focus: mode,
 					weeks: `${lc.week}-${through}`,
+					projection_window: windowLabel,
 					trades: picked.slice(0, limit ?? 6).map((d) => ({
 						partner: lc.team(d.partner.roster_id).owner,
 						give: side(d.give),
@@ -473,7 +492,9 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					})),
 					...(picked.length ? {} : { note: "No fair trade improves both lineups under these filters." }),
 					method:
-						"Lineup change = best projected starting lineup (avg of the next 3 weeks' Sleeper projections, league scoring) after minus before. " +
+						"proj_ppg_next3 = Sleeper's projection per game (league scoring) averaged over the weeks of projection_window he's projected to play; games_next3 says how many. " +
+						"It is not rest-of-season ppg (project_player) or actual ppg (get_player_usage). " +
+						"Lineup change = best projected starting lineup in each window week (byes and projected absences count as 0), averaged, after minus before. " +
 						"Trades must help you, cost them at most 1 point a week, and be within 20% on value (" +
 						(dynasty && mode !== "win_now" ? "a blend of rest-of-season VOR and dynasty market value" : "rest-of-season VOR") +
 						"). Run evaluate_trade on any of these for the full picture.",
