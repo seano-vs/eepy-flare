@@ -24,14 +24,17 @@ come out right without hand-tuned multipliers.
 | `search_players` | Player lookup by name, team or position, showing who rosters each player |
 | `project_player` | One player: this week's projection and key stats, rest-of-season points, VOR and season to date |
 | `compare_players` | 2–8 players side by side, for this week (start/sit) and rest of season |
-| `evaluate_trade` | Rest-of-season points and VOR given versus received, plus the effect on both teams' best lineup this week. In dynasty leagues it also gives a long-term verdict |
+| `evaluate_trade` | Rest-of-season points and VOR given versus received, plus the effect on both teams' best lineup this week. In dynasty leagues it also values draft picks and gives a long-term verdict |
 | `get_player_usage` | Week-by-week usage for 1–6 players: snap share, targets, target and air-yards share, WOPR, carries, league-scored points versus expected points, and the current injury report |
 | `get_opportunity_leaders` | Rank players by expected points or usage over recent weeks. `available_only` finds waiver targets; `buy_low` / `sell_high` find players scoring well below or above their usage |
 | `get_injury_report` | Official injury report (game status and practice participation) for your roster, an NFL team, or another fantasy team |
 | `get_nfl_schedule` | A week's games with kickoff, spread, total, implied team totals, scores, and which of your players are in each game |
-| `get_nfl_data_status` | When each nflverse dataset was last checked and last changed |
+| `get_nfl_data_status` | When each nflverse dataset was last checked and last changed, and any sync errors |
+| `get_defense_vs_position` | Fantasy points each defense allows per game to QB/RB/WR/TE under league scoring, ranked |
+| `get_faab_advice` | FAAB bid ranges from this league's own bidding history, matched by position and expected points, plus remaining budgets |
+| `find_trades` | Searches every roster for 1-for-1 and 2-for-1 trades that improve your lineup without hurting theirs, within 20% on value |
 
-The last five use [nflverse](#nflverse-data-d1) data, the same files the
+The nflverse-backed tools use [nflverse](#nflverse-data-d1) data, the same files the
 [nflreadpy](https://pypi.org/project/nflreadpy/) and nflreadr packages download.
 
 All output is compact JSON, and player IDs are always resolved to `Name POS TEAM (injury)`.
@@ -105,6 +108,9 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 | `nfl_ecr` | FantasyPros consensus rankings via DynastyProcess `db_fpecr_latest`: weekly superflex and positional, rest-of-season positional, dynasty superflex | weekly |
 | `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ↔ FantasyPros ids | daily |
 
+- **Failures.** A dataset that fails to sync (after one retry on a 5xx) keeps its last good data.
+  The error is stored in `nfl_sync_errors` and reported by `get_nfl_data_status` until a sync
+  succeeds.
 - **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
   unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
   column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
@@ -139,6 +145,27 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 - **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
   nflverse (nflverse.com), ffverse, and DynastyProcess. Next Gen Stats come from the NFL and
   rankings from FantasyPros, both as republished by those projects.
+
+### Advisors
+
+- **FAAB bids.** Every waiver claim in the league is read from Sleeper's transactions, including
+  losing bids. For each claimed player, the server computes expected points per game (league
+  scoring) over the 3 weeks before the claim. A target's bid range comes from the closest
+  same-position claims by expected points: low, likely and aggressive at the 25th, 50th and 75th
+  percentile, with aggressive also clearing the best losing bid seen. With fewer than two close
+  comparables, it places the player within the position's whole claim history instead. Without a
+  player, it ranks the best available targets, skipping anyone out or on IR.
+- **Trade finder.** Player value is the average of the next 3 weeks' Sleeper projections under
+  league scoring, so byes and current roles count. For every other roster it tries each 1-for-1
+  and 2-for-1 swap, recomputes both teams' best starting lineups, and keeps trades that improve
+  yours, cost theirs at most a point a week, and are within 20% on value. In dynasty leagues,
+  value blends rest-of-season VOR with dynasty market value according to `focus`.
+- **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
+  that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
+  from the original owner's standing (worst record picks first). `traded_picks` determines who owns
+  each pick, and the tool warns when the side giving a pick doesn't own it.
+- **Matchups.** `get_my_roster` shows each player's opponent and that defense's rank in points
+  allowed to his position this season.
 
 ## Setup
 
@@ -300,6 +327,9 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 | `nfl_ecr` | FantasyPros consensus rankings via DynastyProcess `db_fpecr_latest`: weekly superflex and positional, rest-of-season positional, dynasty superflex | weekly |
 | `nfl_player_ids` | [DynastyProcess](https://github.com/dynastyprocess/data) `db_playerids`: Sleeper ↔ GSIS ↔ PFR ↔ FantasyPros ids | daily |
 
+- **Failures.** A dataset that fails to sync (after one retry on a 5xx) keeps its last good data.
+  The error is stored in `nfl_sync_errors` and reported by `get_nfl_data_status` until a sync
+  succeeds.
 - **Refresh.** A cron runs hourly at `:23`. Each file is fetched with its stored `ETag`, so an
   unchanged file returns `304` and costs one request and no parsing. A changed file is parsed with a
   column-selective CSV reader, and its rows are grouped into weeks and hashed. Only weeks whose hash
@@ -334,6 +364,27 @@ reduced to fantasy-relevant columns and QB/RB/WR/TE:
 - **Licensing.** nflverse, ffopportunity and DynastyProcess data are CC-BY 4.0. Credit:
   nflverse (nflverse.com), ffverse, and DynastyProcess. Next Gen Stats come from the NFL and
   rankings from FantasyPros, both as republished by those projects.
+
+### Advisors
+
+- **FAAB bids.** Every waiver claim in the league is read from Sleeper's transactions, including
+  losing bids. For each claimed player, the server computes expected points per game (league
+  scoring) over the 3 weeks before the claim. A target's bid range comes from the closest
+  same-position claims by expected points: low, likely and aggressive at the 25th, 50th and 75th
+  percentile, with aggressive also clearing the best losing bid seen. With fewer than two close
+  comparables, it places the player within the position's whole claim history instead. Without a
+  player, it ranks the best available targets, skipping anyone out or on IR.
+- **Trade finder.** Player value is the average of the next 3 weeks' Sleeper projections under
+  league scoring, so byes and current roles count. For every other roster it tries each 1-for-1
+  and 2-for-1 swap, recomputes both teams' best starting lineups, and keeps trades that improve
+  yours, cost theirs at most a point a week, and are within 20% on value. In dynasty leagues,
+  value blends rest-of-season VOR with dynasty market value according to `focus`.
+- **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
+  that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
+  from the original owner's standing (worst record picks first). `traded_picks` determines who owns
+  each pick, and the tool warns when the side giving a pick doesn't own it.
+- **Matchups.** `get_my_roster` shows each player's opponent and that defense's rank in points
+  allowed to his position this season.
 
 ## Setup
 
@@ -408,3 +459,5 @@ npm test                 # vitest: scoring, replacement level, lineup optimizer,
 | `src/nflverse/stats.ts` | League-scored actual and expected points, and D1 queries |
 | `src/nflverse/context.ts` | Compact per-player context (usage, rankings, injuries) used by the existing tools |
 | `src/result.ts` | Shared tool-result helpers |
+| `src/advisor.ts` | FAAB advice, trade finder and draft-pick valuation |
+| `.github/workflows/ci.yml` | CI: `wrangler types --check`, typecheck, tests, dry-run build |

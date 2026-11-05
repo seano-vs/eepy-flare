@@ -38,6 +38,10 @@ const calls = [
 	["get_injury_report", {}],
 	["get_nfl_schedule", {}],
 	["get_nfl_data_status", {}],
+	["get_defense_vs_position", { position: "WR" }],
+	["get_faab_advice", { limit: 3 }],
+	["find_trades", { limit: 3 }],
+	["evaluate_trade", { give: ["Josh Allen"], get_picks: [{ season: String(new Date().getFullYear() + 1), round: 1 }] }],
 ];
 
 let failed = 0;

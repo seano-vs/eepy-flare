@@ -411,6 +411,51 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		},
 	);
 
+	// ------------------------------------------------------------ defense vs position
+	server.registerTool(
+		"get_defense_vs_position",
+		{
+			title: "Points allowed by position",
+			description:
+				"How many fantasy points (this league's scoring) each NFL defense allows per game to QBs, RBs, WRs and TEs, with ranks (1 = allows the most = best matchup). " +
+				"Use for start/sit and streaming. Built from nflverse box scores.",
+			inputSchema: z.object({
+				position: z.enum(["QB", "RB", "WR", "TE"]).optional().describe("One position, sorted best matchup first. Omit for every team's rank at all four."),
+				weeks: z.number().int().min(1).max(18).optional().describe("Only the most recent N weeks (default: whole season)."),
+				team: z.string().optional().describe("Only this defense (e.g. 'MIA')."),
+			}),
+			annotations: READ_ONLY,
+		},
+		async ({ position, weeks, team }) => {
+			try {
+				const { lc, nfl } = await load();
+				const latest = await nfl.latestWeek();
+				if (!latest) return ok({ note: "No nflverse stats for this season yet." });
+				const from = weeks ? Math.max(1, latest - weeks + 1) : 1;
+				const allowed = await nfl.pointsAllowed(lc.league.scoring_settings, from, latest);
+				const t = team?.trim().toUpperCase();
+				const defs = [...allowed.keys()].filter((d) => !t || d === t);
+				if (position) {
+					const rows = defs
+						.map((d) => ({ defense: d, ...allowed.get(d)!.get(position) }))
+						.filter((r) => r.rank)
+						.sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99));
+					return ok({ weeks: `${from}-${latest}`, position, defenses: rows, note: "ppg = league-scored points allowed per game to the position; rank 1 = most allowed." });
+				}
+				const rows = defs
+					.map((d) => {
+						const m = allowed.get(d)!;
+						const cell = (p: string) => (m.get(p) ? `${m.get(p)!.rank} (${m.get(p)!.ppg})` : null);
+						return { defense: d, QB: cell("QB"), RB: cell("RB"), WR: cell("WR"), TE: cell("TE") };
+					})
+					.sort((a, b) => a.defense.localeCompare(b.defense));
+				return ok({ weeks: `${from}-${latest}`, defenses: rows, note: "Each cell: rank (ppg allowed). Rank 1 = most points allowed to that position = best matchup." });
+			} catch (e) {
+				return fail(e);
+			}
+		},
+	);
+
 	// ------------------------------------------------------------ status
 	server.registerTool(
 		"get_nfl_data_status",

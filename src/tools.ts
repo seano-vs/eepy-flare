@@ -14,8 +14,9 @@ import {
 } from "./scoring";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { READ_ONLY, fail, fmt, ok } from "./result";
-import { impliedTotals, playerContext, type PlayerContext } from "./nflverse/context";
+import { impliedTotals, matchups, playerContext, type PlayerContext } from "./nflverse/context";
 import { registerNflTools } from "./nfl-tools";
+import { pickSchema, registerAdvisorTools, valuePicks } from "./advisor";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
 
 export { fmt };
@@ -141,18 +142,22 @@ export function createServer(env: Env): McpServer {
 				const lc = await ctx();
 				const r = lc.myRoster();
 				const w = week ?? lc.week;
-				const [poolArr, nflCtx, implied] = await Promise.all([
+				const [poolArr, nflCtx, implied, matchup] = await Promise.all([
 					weekPool(env.PLAYERS, lc.league, lc.season, w, lc.seasonType),
 					playerContext(lc, r.players ?? [], { dynasty: isDynasty(lc.league) }),
 					impliedTotals(lc, w),
+					matchups(lc, w),
 				]);
 				const pool = poolMap(poolArr);
 				const proj = (id: string) => pool.get(id)?.pts ?? (pool.size ? 0 : null);
 				// nflverse context per player: weekly consensus rank, injury report, team implied total, recent usage.
 				const extra = (id: string) => {
 					const c = nflCtx.get(id);
-					const team = lc.players.get(id)?.team;
+					const pl = lc.players.get(id);
+					const team = pl?.team;
+					const m = matchup(team, pl?.pos);
 					return {
+						...(m ? { vs: `${m.home ? "" : "@"}${m.opp}`, ...(m.def_rank ? { def_rank: m.def_rank } : {}) } : team && implied.size ? { vs: "BYE" } : {}),
 						...(c?.ecr?.week ? { ecr: c.ecr.week } : {}),
 						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 						...(c?.injury_report ? { injury_report: c.injury_report } : {}),
@@ -577,16 +582,22 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Evaluate trade",
 			description:
-				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (Sleeper dynasty ADP) and gives separate win-now and long-term verdicts.",
+				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (Sleeper dynasty ADP, plus draft picks) and gives separate win-now and long-term verdicts.",
 			inputSchema: z.object({
-				give: z.array(z.string()).min(1).max(8).describe("Players you send (names or ids)."),
-				get: z.array(z.string()).min(1).max(8).describe("Players you receive (names or ids)."),
+				give: z.array(z.string()).max(8).optional().describe("Players you send (names or ids)."),
+				get: z.array(z.string()).max(8).optional().describe("Players you receive (names or ids)."),
+				give_picks: z.array(pickSchema).max(6).optional().describe("Draft picks you send."),
+				get_picks: z.array(pickSchema).max(6).optional().describe("Draft picks you receive."),
 				team: z.string().optional().describe("Whose side 'give' is. Default: the configured user ('me')."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ give, get, team }) => {
+		async ({ give: giveIn, get: getIn, give_picks, get_picks, team }) => {
 			try {
+				const give = giveIn ?? [];
+				const get = getIn ?? [];
+				if (!give.length && !give_picks?.length) return fail("Nothing given: pass give and/or give_picks.");
+				if (!get.length && !get_picks?.length) return fail("Nothing received: pass get and/or get_picks.");
 				const lc = await ctx();
 				const v = await valuations(lc, [...give, ...get], undefined, false);
 				const g = v.rows.slice(0, give.length);
@@ -623,11 +634,21 @@ export function createServer(env: Env): McpServer {
 					return { before: b, after: a, change: round(a - b, 1) };
 				};
 
+				// Draft picks: valued on the dynasty scale (no rest-of-season points).
+				const pickPartnerId = partner?.roster_id ?? (get_picks?.find((p) => p.from) ? lc.findRoster(get_picks.find((p) => p.from)!.from).roster_id : undefined);
+				const [givePicks, getPicks] = await Promise.all([
+					valuePicks(lc, give_picks ?? [], mine.roster_id),
+					valuePicks(lc, get_picks ?? [], pickPartnerId),
+				]);
+				for (const p of [...givePicks, ...getPicks]) if (p.warning) warnings.push(p.warning);
+				if ((givePicks.length || getPicks.length) && !v.dynasty) warnings.push("Draft picks only carry value in dynasty/keeper formats; they're shown but not counted.");
+				const pickSum = (ps: typeof givePicks) => ps.reduce((a, p) => a + p.value, 0);
+
 				const verdict =
 					Math.abs(diff) < 5 ? "roughly even" : diff > 0 ? (diff > 25 ? "clearly favors you" : "favors you") : diff < -25 ? "clearly favors them" : "favors them";
-				// Dynasty: also compare long-term market value, as a share of the bigger side.
-				const giveDyn = sum(g, "dynasty_value");
-				const getDyn = sum(r, "dynasty_value");
+				// Dynasty: also compare long-term market value (players + picks), as a share of the bigger side.
+				const giveDyn = sum(g, "dynasty_value") + (v.dynasty ? pickSum(givePicks) : 0);
+				const getDyn = sum(r, "dynasty_value") + (v.dynasty ? pickSum(getPicks) : 0);
 				const dynDiff = round(getDyn - giveDyn, 0);
 				const dynPct = Math.max(giveDyn, getDyn) > 0 ? dynDiff / Math.max(giveDyn, getDyn) : 0;
 				const dynastyVerdict =
@@ -638,6 +659,8 @@ export function createServer(env: Env): McpServer {
 					weeks: `${v.week}-${v.through_week}`,
 					give: g,
 					get: r,
+					...(givePicks.length ? { give_picks: givePicks.map(({ warning: _w, ...p }) => p) } : {}),
+					...(getPicks.length ? { get_picks: getPicks.map(({ warning: _w, ...p }) => p) } : {}),
 					totals: {
 						give: { ros_pts: sum(g, "ros_pts"), ros_vor: giveVor },
 						get: { ros_pts: sum(r, "ros_pts"), ros_vor: getVor },
@@ -658,7 +681,8 @@ export function createServer(env: Env): McpServer {
 					note:
 						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled." +
 						(v.dynasty
-							? " dynasty_value = market value from Sleeper dynasty ADP (10000 = 1st overall); it is additive, so it overrates trading one star for several depth pieces. Draft picks are not valued."
+							? " dynasty_value = market value from Sleeper dynasty ADP (10000 = 1st overall); it is additive, so it overrates trading one star for several depth pieces. " +
+								"A pick is valued as this year's rookie drafted at that overall slot (current dynasty value), minus 10% per extra year out; slot defaults to the original owner's current standing."
 							: ""),
 				});
 			} catch (e) {
@@ -668,6 +692,7 @@ export function createServer(env: Env): McpServer {
 	);
 
 	registerNflTools(server, env);
+	registerAdvisorTools(server, env);
 
 	return server;
 }
@@ -762,7 +787,8 @@ function compactRecent(r: NonNullable<PlayerContext["recent"]>) {
 }
 
 const CONTEXT_LEGEND =
-	"ecr = FantasyPros consensus positional rank this week (omitted until this week's rankings are published); ros_rank = rest-of-season rank. implied = team's Vegas implied points. " +
+	"ecr = FantasyPros consensus positional rank this week (omitted until this week's rankings are published); ros_rank = rest-of-season rank. " +
+	"vs = this week's opponent (@ = away, BYE = no game); def_rank = that defense's rank in points allowed to the player's position this season (1 = most allowed, best matchup; 32 = toughest). implied = team's Vegas implied points. " +
 	"recent = per-game over the last 3 weeks with stats: snap %, targets and target share, carries, rz_opps (red-zone targets + carries), " +
 	"pts under league scoring and xfp (expected points for that usage). injury_report = official report: status (injury), practice.";
 

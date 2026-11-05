@@ -150,6 +150,34 @@ export async function playerContext(
 	return out;
 }
 
+export interface Matchup {
+	opp: string;
+	home: boolean;
+	/** Opponent's rank in league points allowed to this position this season (1 = most allowed). */
+	def_rank?: number;
+	def_ppg?: number;
+}
+
+/**
+ * This week's opponent and how generous that defense has been to each position.
+ * Returns a lookup by (NFL team, position); empty when the mirror isn't available.
+ */
+export async function matchups(lc: LeagueContext, week: number): Promise<(team: string | null | undefined, pos: string | undefined) => Matchup | undefined> {
+	try {
+		const nfl = NflData.from(lc.env, lc.season);
+		const latest = await nfl.latestWeek();
+		const [opps, allowed] = await Promise.all([nfl.opponents(week), latest ? nfl.pointsAllowed(lc.league.scoring_settings, 1, latest) : new Map()]);
+		return (team, pos) => {
+			const o = team ? opps.get(team) : undefined;
+			if (!o) return undefined;
+			const a = pos ? allowed.get(o.opp)?.get(pos) : undefined;
+			return { opp: o.opp, home: o.home, ...(a ? { def_rank: a.rank, def_ppg: a.ppg } : {}) };
+		};
+	} catch {
+		return () => undefined;
+	}
+}
+
 /** True when a FantasyPros scrape date precedes the most recent Tuesday (UTC), i.e. a prior NFL week. */
 export function weeklyStale(scrapeDate: string, now = new Date()): boolean {
 	const d = Date.parse(`${scrapeDate}T00:00:00Z`);

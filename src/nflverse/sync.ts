@@ -170,10 +170,17 @@ async function sha256(s: string): Promise<string> {
 // ---------------------------------------------------------------- sync
 
 async function fetchCsv(d: Dataset, url: string, etag: string | null) {
-	const res = await fetch(url, {
-		headers: { accept: "text/csv,application/gzip,*/*", ...(etag ? { "if-none-match": etag } : {}) },
-		cache: "no-store",
-	});
+	const get = () =>
+		fetch(url, {
+			headers: { accept: "text/csv,application/gzip,*/*", ...(etag ? { "if-none-match": etag } : {}) },
+			cache: "no-store",
+		});
+	// GitHub release downloads occasionally return a transient 5xx: retry once before failing.
+	let res = await get().catch(() => null);
+	if (!res || res.status >= 500) {
+		await new Promise((r) => setTimeout(r, 2000));
+		res = await get();
+	}
 	if (res.status === 304) return { status: 304 as const };
 	if (res.status === 404) return { status: 404 as const };
 	if (!res.ok) throw new Error(`${d.id}: HTTP ${res.status} from ${new URL(url).hostname}`);

@@ -233,6 +233,27 @@ export class NflData {
 		return this.all("SELECT * FROM nfl_games WHERE season = ? AND week = ? ORDER BY gameday, gametime, game_id", this.season, week);
 	}
 
+	/**
+	 * League-scored points allowed per game by each defense to each position, over a week
+	 * range, with ranks (1 = most allowed = best matchup). Built from player-week box scores.
+	 */
+	async pointsAllowed(scoring: Record<string, number>, fromWeek: number, toWeek: number): Promise<PointsAllowed> {
+		const rows = await this.weekRange("nfl_player_week", fromWeek, toWeek, "AND season_type = 'REG'");
+		return computePointsAllowed(rows, scoring);
+	}
+
+	/** team -> this week's opponent (Sleeper abbreviations), from the schedule. */
+	async opponents(week: number): Promise<Map<string, { opp: string; home: boolean }>> {
+		const out = new Map<string, { opp: string; home: boolean }>();
+		for (const g of await this.games(week)) {
+			const home = sleeperTeam(g.home_team)!;
+			const away = sleeperTeam(g.away_team)!;
+			out.set(home, { opp: away, home: true });
+			out.set(away, { opp: home, home: false });
+		}
+		return out;
+	}
+
 	async status(): Promise<Row[]> {
 		const rows = await this.all("SELECT dataset, season, checked_at, changed_at, rows, note FROM nfl_sync ORDER BY dataset");
 		const errors = await this.all<{ dataset: string; error: string; failed_at: string; failures: number }>(
@@ -247,6 +268,42 @@ export class NflData {
 		for (const e of errors) if (!rows.some((r) => r.dataset === e.dataset)) out.push({ dataset: e.dataset, last_error: e.error, failed_at: e.failed_at, consecutive_failures: e.failures });
 		return out;
 	}
+}
+
+export type PointsAllowed = Map<string, Map<string, { ppg: number; games: number; rank: number }>>;
+
+/** Pure part of pointsAllowed (exported for tests). Ranks are per position across defenses. */
+export function computePointsAllowed(rows: Row[], scoring: Record<string, number>): PointsAllowed {
+	// Sum per defense/position/week first, so a defense facing two RBs in a game counts both.
+	const games = new Map<string, Map<string, Map<number, number>>>();
+	for (const r of rows) {
+		const def = sleeperTeam(r.opp);
+		const pos = String(r.position ?? "");
+		if (!def || !pos) continue;
+		const byPos = games.get(def) ?? new Map<string, Map<number, number>>();
+		games.set(def, byPos);
+		const byWeek = byPos.get(pos) ?? new Map<number, number>();
+		byPos.set(pos, byWeek);
+		const w = Number(r.week);
+		byWeek.set(w, (byWeek.get(w) ?? 0) + leaguePoints(r, scoring));
+	}
+	const out: PointsAllowed = new Map();
+	const perPos = new Map<string, { def: string; ppg: number }[]>();
+	for (const [def, byPos] of games) {
+		const m = new Map<string, { ppg: number; games: number; rank: number }>();
+		out.set(def, m);
+		for (const [pos, byWeek] of byPos) {
+			const vals = [...byWeek.values()];
+			const ppg = round(vals.reduce((a, b) => a + b, 0) / vals.length, 1);
+			m.set(pos, { ppg, games: vals.length, rank: 0 });
+			perPos.set(pos, [...(perPos.get(pos) ?? []), { def, ppg }]);
+		}
+	}
+	for (const [pos, list] of perPos) {
+		list.sort((a, b) => b.ppg - a.ppg);
+		list.forEach((x, i) => (out.get(x.def)!.get(pos)!.rank = i + 1));
+	}
+	return out;
 }
 
 export interface PlayerIds {
