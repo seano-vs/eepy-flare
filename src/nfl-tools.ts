@@ -8,6 +8,7 @@ import { NflData, expectedPoints, fillPlayedWeeks, leaguePoints, sleeperTeam, un
 import { describeInjury, isUnavailable, weeklyStale } from "./nflverse/context";
 import { latestHeadlines, practiceFromNews, roleSignal } from "./news";
 import { rankWaiverTargets } from "./waiver-targets";
+import { gameWeather, type GameWeather } from "./weather";
 import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
 import { poolFetchedAt, weekPool } from "./scoring";
 import { READ_ONLY, fail, fmt, ok } from "./result";
@@ -66,6 +67,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				const injuries = gsisIds.length
 					? (await nfl.currentInjuries(`AND gsis_id IN (${gsisIds.map(() => "?").join(",")})`, ...gsisIds)).rows
 					: [];
+				const byes = await nfl.teamByes().catch(() => new Map<string, Set<number>>());
 				const out = [];
 				for (const p of resolved) {
 					const id = ids.get(p.id);
@@ -130,9 +132,15 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					const per = (k: string) => round(avg(rows.map((x) => num(x as Row, k))), 1);
 					const inj = injuries.find((i) => i.gsis_id === id.gsis_id);
 					const rzTotals = pbp.length ? redZoneTotals(pbp, p.pos, rows.length) : {};
+					// Show byes and missed weeks as rows, so a gap isn't mistaken for missing data (averages use games played).
+					const played = new Set(rows.map((x) => x.week));
+					const teamByes = byes.get(p.team ?? "") ?? new Set<number>();
+					const gapsRows = Array.from({ length: latest - from + 1 }, (_, i) => from + i)
+						.filter((w) => !played.has(w))
+						.map((w) => (teamByes.has(w) ? { week: w, bye: true } : { week: w, did_not_play: true }));
 					out.push({
 						...base,
-						weeks: rows,
+						weeks: [...rows, ...gapsRows].sort((a, b) => a.week - b.week),
 						per_game: {
 							games: rows.length,
 							...(snaps.length ? { snap_pct: per("snap_pct") } : {}),
@@ -428,7 +436,7 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		{
 			title: "NFL schedule and lines",
 			description:
-				"NFL games for a week with kickoff time, Vegas spread and total, implied team totals, scores, and which of your players are in each game.",
+				"NFL games for a week with kickoff time, Vegas spread and total, implied team totals, scores, which of your players are in each game, and game-time weather for upcoming outdoor games (Open-Meteo forecast at the home stadium: temperature, wind, gusts, precipitation, with flags for wind, rain/snow and cold).",
 			inputSchema: z.object({
 				week: z.number().int().min(1).max(22).optional().describe("Default: the current week."),
 				team: z.string().optional().describe("Only this NFL team's game (e.g. 'KC')."),
@@ -442,6 +450,12 @@ export function registerNflTools(server: McpServer, env: Env): void {
 				let games = await nfl.games(w);
 				const t = team?.trim().toUpperCase();
 				if (t) games = games.filter((g) => sleeperTeam(g.home_team) === t || sleeperTeam(g.away_team) === t);
+				if (t && !games.length) {
+					const all = await nfl.games(w);
+					return ok({ week: w, team: t, games: [], ...(all.length ? { bye: true, note: `${t} is on bye in week ${w}.` } : { note: `No schedule for week ${w} yet.` }) });
+				}
+				const upcoming = games.filter((g) => typeof g.home_score !== "number");
+				const weather = upcoming.length ? await gameWeather(upcoming).catch(() => new Map<string, GameWeather>()) : new Map<string, GameWeather>();
 				let mine: Map<string, string[]> = new Map();
 				try {
 					for (const id of lc.myRoster().players ?? []) {
@@ -471,6 +485,12 @@ export function registerNflTools(server: McpServer, env: Env): void {
 								: {}),
 							...(played ? { score: `${away} ${g.away_score} - ${home} ${g.home_score}` } : {}),
 							...(my.length ? { my_players: my } : {}),
+							...(() => {
+								const wx = weather.get(home);
+								if (!wx || played) return {};
+								const { game: _g, kickoff_et: _k, ...rest } = wx;
+								return { weather: rest };
+							})(),
 						};
 					}),
 				});
@@ -558,7 +578,19 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						note: "Players cache (injury tags) refreshes daily at 09:17 UTC; projections are cached up to 6 hours, ADP 12 hours.",
 					},
 					...(ecrRow
-						? { fantasypros: { scraped: ecrRow, weekly_ranks_current: !weeklyStale(ecrRow), note: "Weekly ranks are hidden once a new NFL week starts until FantasyPros publishes the next scrape." } }
+						? {
+								fantasypros: {
+									scraped: ecrRow,
+									weekly_ranks_current: !weeklyStale(ecrRow),
+									...(() => {
+										const days = Math.floor((Date.now() - Date.parse(ecrRow)) / 86_400_000);
+										return days > 7
+											? { stale_days: days, warning: `The FantasyPros scrape is ${days} days old although the file keeps updating upstream, so DynastyProcess's scrape looks stuck. Weekly ranks are hidden and rest-of-season ranks are out of date.` }
+											: {};
+									})(),
+									note: "Weekly ranks are hidden once a new NFL week starts until FantasyPros publishes the next scrape.",
+								},
+							}
 						: {}),
 					...(reports?.week
 						? { injury_reports: { week: reports.week, posted: reports.published.size, not_posted: [...allTeams].filter((t) => !reports.published.has(t)).sort() } }

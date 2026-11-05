@@ -6,7 +6,11 @@ export const PLAYERS_KV_KEY = "players:nfl:v1";
 export const FANTASY_POSITIONS = ["QB", "RB", "WR", "TE", "K", "DEF"] as const;
 const KEEP = new Set<string>(FANTASY_POSITIONS);
 
-/** [name, position, team, injury_status, age, years_exp, search_rank, status] */
+/**
+ * [name, position, team, injury_status, age, years_exp, search_rank, status,
+ *  depth_chart_position, depth_chart_order, injury_start_date, injury_body_part, active (1/0)]
+ * The last five were added in 1.5; blobs written before then simply lack them.
+ */
 export type PlayerTuple = [
 	string,
 	string,
@@ -16,6 +20,11 @@ export type PlayerTuple = [
 	number | null,
 	number | null,
 	string | null,
+	(string | null)?,
+	(number | null)?,
+	(string | null)?,
+	(string | null)?,
+	(0 | 1 | null)?,
 ];
 
 export interface PlayersBlob {
@@ -38,6 +47,11 @@ export interface RawPlayer {
 	years_exp?: number | null;
 	search_rank?: number | null;
 	status?: string | null;
+	depth_chart_position?: string | null;
+	depth_chart_order?: number | null;
+	injury_start_date?: string | null;
+	injury_body_part?: string | null;
+	active?: boolean | null;
 }
 
 /** Reduce the raw Sleeper dump to the compact blob we store. Pure; exported for tests. */
@@ -63,6 +77,11 @@ export function compactPlayers(raw: Record<string, RawPlayer>, now = new Date())
 			// 9999999 is Sleeper's "unranked" sentinel; drop it to save space.
 			p.search_rank != null && p.search_rank < 9_999_999 ? p.search_rank : null,
 			p.status ?? null,
+			p.depth_chart_position ?? null,
+			p.depth_chart_order ?? null,
+			p.injury_start_date ?? null,
+			p.injury_body_part ?? null,
+			p.active == null ? null : p.active ? 1 : 0,
 		];
 	}
 	return { v: 1, updated: now.toISOString(), count: Object.keys(players).length, players };

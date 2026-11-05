@@ -56,20 +56,22 @@ export function verifyNotes(i: VerifyInput): string[] {
 	const outNow = i.outWeeks.includes(i.week);
 	const playsNow = i.playedWeeks.includes(i.week);
 
-	// One note per absence: what's missing, why it's suspicious, and the projected return.
-	if (i.outWeeks.length) {
-		const back = i.playedWeeks.find((w) => w > i.outWeeks[0]!);
-		const returns = outNow && back != null ? ` Projected to return in week ${back}${tag ? ` (listed ${tag})` : ""}: treat that as the earliest case and check the official timeline.` : "";
-		if (!tag) {
+	// One note per gap (a run of missed weeks, byes don't break it). The current gap is explained
+	// by the injury tag if there is one; a later gap has no listed reason.
+	for (const gap of gaps(i.outWeeks, i.byeWeeks)) {
+		const current = gap.includes(i.week);
+		const back = i.playedWeeks.find((w) => w > gap[gap.length - 1]!);
+		const returns = back != null ? ` Projected to return in week ${back}${current && tag ? ` (listed ${tag})` : ""}: treat that as the earliest case and check the official timeline.` : "";
+		if (current && tag && GAME_TIME.has(tag)) {
+			notes.push(`Listed ${tag} but projected for no game this week, so Sleeper may be assuming he sits. Check the final injury report and inactives.${returns}`);
+		} else if (current && tag) {
+			if (returns) notes.push(returns.trim());
+		} else {
 			notes.push(
-				`Projected for no game in ${formatWeeks(i.outWeeks)}, with no injury or status listed. ` +
-					"Sleeper doesn't say why (benching, suspension, depth chart?), so find a dated source before relying on it." +
+				`Projected for no game in ${formatWeeks(gap)}, with no ${tag && !current ? "reason listed for that stretch" : "injury or status listed"}. ` +
+					"Sleeper doesn't say why (benching, suspension, depth chart, an old injury assumption?), so find a dated source before relying on it." +
 					returns,
 			);
-		} else if (GAME_TIME.has(tag) && outNow) {
-			notes.push(`Listed ${tag} but projected for no game this week, so Sleeper may be assuming he sits. Check the final injury report and inactives.${returns}`);
-		} else if (returns) {
-			notes.push(returns.trim());
 		}
 	}
 	if (tag && NOT_PLAYING.has(tag) && playsNow) {
@@ -89,6 +91,20 @@ export function verifyNotes(i: VerifyInput): string[] {
 		}
 	}
 	return notes;
+}
+
+/** Split out-weeks into runs; a bye week between two out-weeks doesn't end a run. */
+export function gaps(outWeeks: number[], byeWeeks: number[] = []): number[][] {
+	const sorted = [...new Set(outWeeks)].sort((a, b) => a - b);
+	const byes = new Set(byeWeeks);
+	const runs: number[][] = [];
+	for (const w of sorted) {
+		const last = runs[runs.length - 1];
+		const prev = last?.[last.length - 1];
+		if (last && prev != null && (w === prev + 1 || (w === prev + 2 && byes.has(prev + 1)))) last.push(w);
+		else runs.push([w]);
+	}
+	return runs;
 }
 
 function round1(n: number): number {

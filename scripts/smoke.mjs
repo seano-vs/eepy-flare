@@ -45,6 +45,9 @@ const calls = [
 	["get_playoff_odds", {}],
 	["get_team_needs", { team: "me" }],
 	["get_player_news", { players: ["Josh Allen"], days: 7 }],
+	["get_manager_profiles", { team: "me" }],
+	["get_changes", { since: "24h" }],
+	["get_transactions", { since: "3d" }],
 	["evaluate_trade", { give: ["Josh Allen"], get_picks: [{ season: String(new Date().getFullYear() + 1), round: 1 }] }],
 ];
 

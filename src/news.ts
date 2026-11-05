@@ -11,6 +11,8 @@ export interface NewsItem {
 	/** Hours since published, at the time of the request. */
 	age_hours: number;
 	url?: string;
+	/** Other outlets that reported the same event within a few hours (merged into this item). */
+	also?: string[];
 	summary?: string;
 }
 
@@ -40,7 +42,7 @@ export function parseNews(data: unknown, now = Date.now()): NewsItem[] {
 export async function playerNews(playerId: string, opts: { limit?: number; maxAgeHours?: number } = {}): Promise<NewsItem[]> {
 	try {
 		const items = parseNews(await sleeper.playerNews(playerId));
-		return items.filter((n) => opts.maxAgeHours == null || n.age_hours <= opts.maxAgeHours).slice(0, opts.limit ?? 5);
+		return dedupeNews(items.filter((n) => opts.maxAgeHours == null || n.age_hours <= opts.maxAgeHours)).slice(0, opts.limit ?? 5);
 	} catch {
 		return [];
 	}
@@ -120,4 +122,44 @@ export async function practiceFromNews(ids: string[], maxAgeHours = 72): Promise
 		}),
 	);
 	return out;
+}
+
+/** What a headline reports, coarsely, so different outlets' takes on one event match. */
+function eventKey(title: string): string | null {
+	const p = practiceFromText(title);
+	if (p) return `practice:${p.practice}:${p.day ?? ""}`;
+	if (/\bruled out\b|\bwon't play\b|\bwill not play\b|\bout for (week|sunday|monday|thursday)\b|\binactive\b/i.test(title)) return "out";
+	const r = roleSignal(title);
+	if (r) return `role:${r.reason}`;
+	if (/\bdoubtful\b/i.test(title)) return "doubtful";
+	if (/\bquestionable\b/i.test(title)) return "questionable";
+	return null;
+}
+
+const words = (t: string) => new Set(t.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w.length >= 4));
+
+/**
+ * Merge items about the same event within 12 hours (newest kept, other sources in `also`).
+ * Items match on the event they report, else on title overlap. Pure; exported for tests.
+ */
+export function dedupeNews(items: NewsItem[]): NewsItem[] {
+	const kept: (NewsItem & { _key: string | null; _w: Set<string> })[] = [];
+	// Words in most of a player's items are his name: they don't say two items match.
+	const freq = new Map<string, number>();
+	for (const n of items) for (const w of words(n.title)) freq.set(w, (freq.get(w) ?? 0) + 1);
+	const common = new Set([...freq].filter(([, c]) => items.length >= 2 && c >= Math.max(2, 0.8 * items.length)).map(([w]) => w));
+	for (const n of items) {
+		const key = eventKey(n.title);
+		const w = new Set([...words(n.title)].filter((x) => !common.has(x)));
+		const dup = kept.find((k) => {
+			if (Math.abs(k.age_hours - n.age_hours) > 12) return false;
+			if (key && k._key) return key === k._key;
+			const inter = [...w].filter((x) => k._w.has(x)).length;
+			return w.size >= 2 && k._w.size >= 2 && inter / Math.min(w.size, k._w.size) >= 0.6;
+		});
+		if (dup) {
+			if (dup.source !== n.source && !(dup.also ?? []).includes(n.source)) dup.also = [...(dup.also ?? []), n.source];
+		} else kept.push({ ...n, _key: key, _w: w });
+	}
+	return kept.map(({ _key: _k, _w: _ww, ...n }) => n);
 }

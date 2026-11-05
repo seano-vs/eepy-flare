@@ -38,8 +38,10 @@ The server says so to every client and points at the assumptions worth checking.
 | `get_faab_advice` | FAAB bid ranges from this league's own bidding history, matched by position and expected points, plus remaining budgets |
 | `find_trades` | Searches every roster for 1-for-1 and 2-for-1 trades that improve your lineup and are fair on value. Options: `exclude`, `shop` one player, `window: "playoffs"`; partners are labeled contending or rebuilding |
 | `get_playoff_odds` | Standings from actual results plus playoff and bye odds from 5,000 simulations of the remaining regular season, including your odds if you win or lose this week |
-| `get_team_needs` | Per team: weak starting slots vs the league, lineup holes in the next two weeks, QB coverage, FAAB left, positions chased on waivers |
+| `get_team_needs` | Per team: two biggest gaps vs the league median, best free-agent adds, weak slots, lineup holes in the next two weeks, QB coverage, FAAB left, positions chased (claims and free-agent adds) |
 | `get_player_news` | Recent headlines for players (or your whole roster) from the feed the Sleeper app shows |
+| `get_manager_profiles` | How each manager operates: trades and partners, adds by position (claims vs free agents), FAAB spent, top/median winning bid, losing bids, last move |
+| `get_changes` | What changed since a time (`24h`, `3d`, ISO): headlines, tag / game status / practice changes and projection moves over 2 points (hourly snapshots), and transactions |
 
 The nflverse-backed tools use [nflverse](#nflverse-data-d1) data, the same files the
 [nflreadpy](https://pypi.org/project/nflreadpy/) and nflreadr packages download.
@@ -226,8 +228,47 @@ Since 1.2:
   starting slot, the two free agents who'd add most to its lineup this week, and its team name.
 - **Search.** `search_players` hides players with no NFL team (unsigned or retired) unless
   they're on a roster here, `team` is `FA`, or `include_teamless` is set.
-- **Verify notes.** Each projected absence gets one note: why it's suspect, plus the projected
-  return week. `get_matchup` quotes a fresh headline for a starter projected 0.
+- **Verify notes.** One note per gap in the projection (a bye doesn't split a gap): the current
+  gap names the injury and projected return; a later gap with no listed reason (an old benching
+  or injury assumption) gets its own note. `get_matchup` quotes a fresh headline for a starter
+  projected 0.
+
+Since 1.5:
+
+- **Lock timeline.** `get_my_roster` adds `lock_timeline` for the current week: starters grouped
+  by kickoff (ET), and for each starter at risk (game-time tag, play rate under 90%, or projected
+  0) up to three bench or free-agent options at an eligible position whose games start later.
+- **Play probability.** `play_pct` on Questionable/Doubtful players: the chance he plays, from
+  base rates measured on nflverse 2016–2025 in this project's Nov 4 analysis (74% overall; 50%
+  after a DNP last practice, 75% Limited, 92% Full; QBs 55%; Doubtful ~10%). The rates are
+  constants in `playProbability` rather than a backfilled table. Before the final report it uses
+  Sleeper's tag and the latest practice, marked preliminary.
+- **Implied total vs norm.** `implied_vs_norm` = this week's Vegas implied total minus the team's
+  average this season. In the same analysis, +3 or more added about 0.7 points and −3 or less
+  cost about 1.0; opponent history and home/away splits didn't predict.
+- **Weather.** `get_nfl_schedule` adds an Open-Meteo forecast (free, no key) for each upcoming
+  outdoor game at the home stadium, for the 3 hours from kickoff: temperature, wind, gusts and
+  precipitation, flagged for high wind, rain/snow and cold. Domes and covered stadiums say
+  indoors; retractable roofs carry a note; neutral-site games (from nflverse's `location`) are
+  skipped. `get_my_roster` shows a player's weather only when it's flagged.
+- **Players cache.** Adds Sleeper's depth chart slot (`depth`: RB1, QB2, or LWR/RWR/SWR + order),
+  `injured_since` and `active`. `search_players` also hides players DynastyProcess lists as free
+  agents who are on no depth chart, since Sleeper keeps some retired players on a team.
+- **Snapshots.** After each hourly nflverse sync, the Worker stores every rostered player's
+  injury tag, game status, practice status and projection in KV (`snap:<hour>`, 14 days) for
+  `get_changes`.
+- **Role flags.** `role_change` now holds usage trends only, with injury-shortened games (under
+  60% of his median snap share) left out of the baseline. Projection mismatches moved to
+  `projection_check`, which cites the injury report when that explains the gap.
+- **News.** Items reporting the same event within 12 hours (same practice status, ruling or role
+  change, or mostly the same words) are merged; the other outlets are listed in `also`.
+- **Transactions.** `get_transactions` takes `since`/`until`, which search across weeks, so one
+  waiver run isn't split between two week lists.
+- **Data status.** `get_nfl_data_status` warns when the FantasyPros scrape is more than 7 days
+  old. As of Nov 5 the upstream DynastyProcess file is stuck at Oct 30.
+- **Byes.** `get_player_usage` shows bye weeks and missed weeks as rows; `get_nfl_schedule` with a
+  team on bye says so.
+- **Schema changes.** When one dataset's columns change, only that table is rebuilt.
 - **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
   that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
   from the original owner's standing (worst record picks first). `traded_picks` determines who owns

@@ -33,11 +33,16 @@ export interface Consensus {
 
 export interface PlayerContext {
 	recent?: RecentUsage;
-	/** Usage that has moved a lot in the last 3 weeks vs earlier in the season, or a projection far from recent usage. */
+	/** Usage trends: usage that moved a lot in the last 3 weeks vs earlier in the season (context). */
 	role_change?: string[];
+	/** Projection mismatches: Sleeper's projection far from recent usage (check these before acting). */
+	projection_check?: string[];
 	ecr?: Consensus;
 	/** Current official report, e.g. "Questionable (Ankle), Limited". */
 	injury_report?: string;
+	/** Chance a Questionable player plays, from 2016-2025 base rates by last practice (see playProbability). */
+	play_pct?: number;
+	play_note?: string;
 }
 
 const num = (r: Row | undefined, k: string): number => {
@@ -51,6 +56,21 @@ const PRACTICE: Record<string, string> = {
 	"Limited Participation in Practice": "Limited",
 	"Full Participation in Practice": "Full",
 };
+
+/**
+ * Chance a player listed Questionable plays, from nflverse 2016-2025 (measured in this project's
+ * Nov 4 analysis): 74% overall; 50% after a DNP last practice, 75% after Limited, 92% after Full;
+ * QBs 55%. Out = 0, Doubtful ~ 10%. Undefined for other statuses. Pure; exported for tests.
+ */
+export function playProbability(status: string | undefined, lastPractice: string | undefined, pos: string | undefined): number | undefined {
+	const st = (status ?? "").toLowerCase();
+	if (st === "out") return 0;
+	if (st === "doubtful") return 10;
+	if (st !== "questionable") return undefined;
+	if (pos === "QB") return 55;
+	const pr = PRACTICE[lastPractice ?? ""] ?? lastPractice;
+	return pr === "DNP" ? 50 : pr === "Limited" ? 75 : pr === "Full" ? 92 : 74;
+}
 
 export function describeInjury(r: Row): string | undefined {
 	const status = (r.report_status as string) || "";
@@ -101,6 +121,18 @@ function usageOver(st: Row[], sn: Row[], o: Row[], p: Row[], pos: string | undef
  * when Sleeper's projection for this week is far from what recent usage supports.
  * Pure; exported for tests.
  */
+/**
+ * Weeks whose snap share is under 60% of the player's median: usually an in-game injury or a
+ * blowout, so they'd distort a baseline. Needs 3+ weeks. Pure; exported for tests.
+ */
+export function shortenedWeeks(snaps: Row[]): Set<number> {
+	const pcts = snaps.map((r) => ({ w: Number(r.week), p: Number(r.offense_pct) })).filter((x) => Number.isFinite(x.p));
+	if (pcts.length < 3) return new Set();
+	const sorted = pcts.map((x) => x.p).sort((a, b) => a - b);
+	const median = sorted[Math.floor(sorted.length / 2)]!;
+	return new Set(pcts.filter((x) => x.p < 0.6 * median).map((x) => x.w));
+}
+
 export function roleFlags(recent: Usage, earlier: Usage | undefined, projection: number | null): string[] {
 	const flags: string[] = [];
 	if (earlier && earlier.games >= 2 && recent.games >= 2) {
@@ -183,9 +215,15 @@ export async function playerContext(
 			const recentUsage = usageOver(stAll.filter(inWindow), snAll.filter(inWindow), oAll.filter(inWindow), p, pos, scoring);
 			if (recentUsage) {
 				ctx.recent = { weeks: `${from}-${latest}`, ...recentUsage };
-				const earlier = usageOver(stAll.filter(before), snAll.filter(before), oAll.filter(before), [], pos, scoring);
+				// Baseline without injury-shortened games (e.g. a Week 1 exit), so a full game later isn't "snaps up".
+				const short = shortenedWeeks(snAll.filter(before));
+				const base = (r: Row) => before(r) && !short.has(Number(r.week));
+				const earlier = usageOver(stAll.filter(base), snAll.filter(base), oAll.filter(base), [], pos, scoring);
 				const flags = roleFlags(recentUsage, earlier, opts.projections?.get(sid) ?? null);
-				if (flags.length) ctx.role_change = flags;
+				const trends = flags.filter((f) => !f.startsWith("Sleeper projects"));
+				const mismatch = flags.filter((f) => f.startsWith("Sleeper projects"));
+				if (trends.length) ctx.role_change = short.size ? [...trends, `(baseline excludes injury-shortened week${short.size > 1 ? "s" : ""} ${[...short].sort((a, b) => a - b).join(", ")})`] : trends;
+				if (mismatch.length) ctx.projection_check = mismatch;
 			}
 			const e = id.fantasypros_id ? ecrBy.get(id.fantasypros_id) : undefined;
 			if (e?.length) {
@@ -210,8 +248,24 @@ export async function playerContext(
 				const text = describeInjury(inj);
 				// Teams post on different days: say when this is last week's report.
 				if (text) ctx.injury_report = Number(inj.week) === injuries.week ? text : `${text} [week ${inj.week} report; week ${injuries.week} not in nflverse yet]`;
+				// Only this week's designation predicts this week's game.
+				// Game status comes with the final (usually Friday) report; until then use Sleeper's tag with the latest practice.
+				const pl = lc.players.get(sid);
+				const thisWeek = Number(inj.week) === injuries.week;
+				const status = thisWeek && inj.report_status ? (inj.report_status as string) : pl?.injury;
+				const pct = playProbability(status, thisWeek ? (inj.practice_status as string) : undefined, pl?.pos);
+				if (pct != null && pct > 0 && pct < 100) {
+					ctx.play_pct = pct;
+					const prelim = !(thisWeek && inj.report_status);
+					if (pct < 90 || prelim)
+						ctx.play_note =
+							(prelim ? "Preliminary: no final game status yet, so this uses Sleeper's tag and the latest practice. " : "") +
+							"Base rate for this designation and practice; if he plays, a limited snap share is a risk. Check inactives 90 minutes before kickoff.";
+				}
 			}
-			if (ctx.recent || ctx.ecr || ctx.injury_report || ctx.role_change) out.set(sid, ctx);
+			// A current injury report often explains a low projection: say so instead of asking.
+			if (ctx.projection_check && ctx.injury_report) ctx.projection_check = ctx.projection_check.map((f) => f.replace("find out what Sleeper expects to change.", `the injury report likely explains it: ${ctx.injury_report}.`));
+			if (ctx.recent || ctx.ecr || ctx.injury_report || ctx.role_change || ctx.projection_check) out.set(sid, ctx);
 		}
 	} catch (e) {
 		console.warn("nflverse context unavailable:", e instanceof Error ? e.message : e);
@@ -277,6 +331,24 @@ export function weeklyStale(scrapeDate: string, now = new Date()): boolean {
 }
 
 /** Team -> implied points for a week; empty when the mirror isn't available. */
+/**
+ * This week's implied total vs the team's season norm. In 2016-2025 data, +3 or more added about
+ * 0.7 fantasy points to a player's game and -3 or less cost about 1.0. Pure; exported for tests.
+ */
+export function impliedDelta(implied: number | undefined, norm: number | undefined): { implied_vs_norm: number; implied_note?: string } | undefined {
+	if (implied == null || norm == null) return undefined;
+	const d = Math.round((implied - norm) * 10) / 10;
+	return { implied_vs_norm: d, ...(d >= 3 ? { implied_note: "3+ above the team's norm: historically about +0.7 pts" } : d <= -3 ? { implied_note: "3+ below the team's norm: historically about -1.0 pts" } : {}) };
+}
+
+export async function impliedNorms(lc: LeagueContext, week: number): Promise<Map<string, number>> {
+	try {
+		return await NflData.from(lc.env, lc.season).impliedNorms(week);
+	} catch {
+		return new Map();
+	}
+}
+
 export async function impliedTotals(lc: LeagueContext, week: number): Promise<Map<string, number>> {
 	try {
 		return await NflData.from(lc.env, lc.season).impliedTotals(week);

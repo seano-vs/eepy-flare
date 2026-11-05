@@ -127,6 +127,19 @@ export class NflData {
 		return out;
 	}
 
+	/** Sleeper ids that DynastyProcess lists as free agents (team FA), e.g. retired players Sleeper still shows on a team. */
+	async dpFreeAgents(sleeperIds: string[]): Promise<Set<string>> {
+		const out = new Set<string>();
+		for (const part of chunks(sleeperIds)) {
+			const rows = await this.all<{ sleeper_id: string }>(
+				`SELECT sleeper_id FROM nfl_player_ids WHERE team = 'FA' AND sleeper_id IN (${part.map(() => "?").join(",")})`,
+				...part,
+			);
+			for (const r of rows) out.add(r.sleeper_id);
+		}
+		return out;
+	}
+
 	/** Rows for many players over a week range (ids chunked to stay under D1's 100 bound parameters). */
 	async forPlayers(table: string, idCol: "gsis_id" | "pfr_id", ids: string[], fromWeek: number, toWeek: number): Promise<Row[]> {
 		const out: Row[] = [];
@@ -170,6 +183,18 @@ export class NflData {
 			out.set(sleeperTeam(g.away_team)!, round((total - spread) / 2, 1));
 		}
 		return out;
+	}
+
+	/** Each team's average implied points over weeks before `week` (its scoring norm per Vegas). */
+	async impliedNorms(week: number): Promise<Map<string, number>> {
+		const rows = await this.all("SELECT home_team, away_team, spread_line, total_line FROM nfl_games WHERE season = ? AND week < ? AND spread_line IS NOT NULL AND total_line IS NOT NULL", this.season, week);
+		const acc = new Map<string, number[]>();
+		for (const g of rows) {
+			const spread = g.spread_line as number;
+			const total = g.total_line as number;
+			for (const [t, v] of [[sleeperTeam(g.home_team)!, (total + spread) / 2], [sleeperTeam(g.away_team)!, (total - spread) / 2]] as const) acc.set(t, [...(acc.get(t) ?? []), v]);
+		}
+		return new Map([...acc].filter(([, xs]) => xs.length >= 3).map(([t, xs]) => [t, round(xs.reduce((a, b) => a + b, 0) / xs.length, 1)]));
 	}
 
 	/** gsis_id -> sleeper_id and pfr_id -> sleeper_id for everyone mapped. */

@@ -78,6 +78,19 @@ describe("verifyNotes", () => {
 		expect(notes[0]).toContain("return in week 8:");
 	});
 
+	it("gives each gap its own note: injury return now, unexplained absence later", () => {
+		// Watson: out now (IR) with a week-10 return, then an old benching assumption in weeks 13-16.
+		const notes = verifyNotes({ ...base, week: 9, injury: "IR", playedWeeks: [10, 11, 12], byeWeeks: [], outWeeks: [9, 13, 14, 15, 16], seasonGames: 0 });
+		expect(notes).toHaveLength(2);
+		expect(notes[0]).toContain("return in week 10 (listed IR)");
+		expect(notes[1]).toContain("weeks 13–16, with no reason listed for that stretch");
+	});
+
+	it("doesn't split a gap at a bye", () => {
+		const notes = verifyNotes({ ...base, playedWeeks: [7, 8], byeWeeks: [10], outWeeks: [9, 11, 12], seasonGames: 0 });
+		expect(notes).toEqual([expect.stringContaining("weeks 9, 11–12")]);
+	});
+
 	it("flags a game-time designation projected for zero, in one note", () => {
 		const notes = verifyNotes({ ...base, injury: "Questionable", playedWeeks: [8, 9], outWeeks: [7] });
 		expect(notes).toHaveLength(1);

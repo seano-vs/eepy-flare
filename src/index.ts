@@ -3,6 +3,8 @@ import { createMcpHandler } from "agents/mcp/server";
 import { authMode, oauthProviderFor } from "./auth";
 import { syncAll } from "./nflverse/sync";
 import { refreshPlayers } from "./players";
+import { LeagueContext } from "./league";
+import { saveSnapshot } from "./changes";
 import { sleeper } from "./sleeper";
 import { SERVER_NAME, SERVER_VERSION, createServer } from "./tools";
 
@@ -44,7 +46,20 @@ export default {
 			return;
 		}
 		// Hourly: mirror nflverse datasets into D1 (only changed files are downloaded).
-		ctx.waitUntil(syncNflverse(env));
+		// Then snapshot rostered players' tags, reports and projections for get_changes.
+		// A sync failure still fails the run (visible in the dashboard), after the snapshot is taken.
+		ctx.waitUntil(
+			(async () => {
+				const sync = await syncNflverse(env).then(
+					() => null,
+					(e: unknown) => e,
+				);
+				await LeagueContext.load(env)
+					.then(saveSnapshot)
+					.catch((e) => console.error("snapshot failed", e));
+				if (sync) throw sync;
+			})(),
+		);
 	},
 } satisfies ExportedHandler<Env>;
 

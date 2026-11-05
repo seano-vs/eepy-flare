@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { roleFlags } from "../src/nflverse/context";
+import { roleFlags, shortenedWeeks } from "../src/nflverse/context";
 import { fillPlayedWeeks } from "../src/nflverse/stats";
 import { parseNews, practiceFromText } from "../src/news";
 import { playoffByes, simulate, standingsFromMatchups } from "../src/playoffs";
@@ -141,5 +141,78 @@ describe("practiceFromText", () => {
 		expect(practiceFromText("Puka Nacua limited at practice on Thursday")).toEqual({ practice: "Limited", day: "Thursday" });
 		expect(practiceFromText("Breece Hall logs full practice Friday after limited Thursday session")).toEqual({ practice: "Full", day: "Friday" });
 		expect(practiceFromText("Josh Allen throws three touchdowns in win")).toBeNull();
+	});
+});
+
+describe("dedupeNews", () => {
+	const item = (title: string, source: string, age: number) => ({ title, source, published: "", age_hours: age });
+	it("merges outlets reporting the same event and keeps distinct news", async () => {
+		const { dedupeNews } = await import("../src/news");
+		const out = dedupeNews([
+			item("Rashee Rice (hamstring/knee) limited at practice Wednesday", "fantasy_pros", 16),
+			item("Rashee Rice Gets in Limited Session on Wednesday", "rotoballer", 17),
+			item("Rashee Rice - Limited Wednesday", "rotowire", 17),
+			item("Rashee Rice catches two touchdowns in win", "rotowire", 70),
+		]);
+		expect(out).toHaveLength(2);
+		expect(out[0]!.also).toEqual(["rotoballer", "rotowire"]);
+		const taylor = dedupeNews([
+			item("Jonathan Taylor Still Remains on Colts' Roster", "rotoballer", 26),
+			item("Colts Asking for a Lot for Jonathan Taylor", "rotoballer", 29),
+			item("Jonathan Taylor does little with a dozen touches in Week 8 loss", "fantasy_pros", 72),
+		]);
+		expect(taylor).toHaveLength(3);
+		const out2 = dedupeNews([item("Sam Darnold - Won't play in Week 9", "rotowire", 20), item("Sam Darnold (quad) ruled out for Week 9", "fantasy_pros", 20)]);
+		expect(out2).toHaveLength(1);
+	});
+});
+
+describe("batch C helpers", () => {
+	it("play probability, implied delta, forecast flags, lock pivots, snapshot diffs", async () => {
+		const { playProbability, impliedDelta } = await import("../src/nflverse/context");
+		expect(playProbability("Questionable", "Did Not Participate In Practice", "WR")).toBe(50);
+		expect(playProbability("Questionable", "Full Participation in Practice", "RB")).toBe(92);
+		expect(playProbability("Questionable", "Limited", "QB")).toBe(55);
+		expect(playProbability("Questionable", undefined, "TE")).toBe(74);
+		expect(playProbability(undefined, "Limited", "WR")).toBeUndefined();
+		expect(impliedDelta(28.8, 23.9)).toMatchObject({ implied_vs_norm: 4.9, implied_note: expect.stringContaining("+0.7") });
+		expect(impliedDelta(15.5, 21.3)?.implied_note).toContain("-1.0");
+
+		const { summarizeForecast } = await import("../src/weather");
+		const h = { time: ["2026-11-08T13:00", "2026-11-08T14:00", "2026-11-08T15:00", "2026-11-08T16:00"], temperature_2m: [31, 30, 30, 29], wind_speed_10m: [14, 17, 21, 18], wind_gusts_10m: [20, 28, 33, 25], precipitation_probability: [60, 70, 80, 60], precipitation: [0.05, 0.1, 0.1, 0] };
+		const f = summarizeForecast(h, "2026-11-08", "13:00")!;
+		expect(f.flags).toEqual(["high wind: downgrade passing and kickers", "snow likely"]);
+
+		const { lockTimeline } = await import("../src/locks");
+		const tl = lockTimeline(
+			[
+				{ slot: "WR", label: "Early WR", pos: "WR", kickoff: "2026-11-08 13:00", proj: 12, risk: "listed Questionable" },
+				{ slot: "QB", label: "Late QB", pos: "QB", kickoff: "2026-11-08 16:25", proj: 20 },
+			],
+			[
+				{ label: "Bench WR", pos: "WR", kickoff: "2026-11-08 16:05", proj: 9, source: "bench" },
+				{ label: "Early FA", pos: "WR", kickoff: "2026-11-08 13:00", proj: 11, source: "free agent" },
+				{ label: "Bench RB", pos: "RB", kickoff: "2026-11-08 20:20", proj: 15, source: "bench" },
+			],
+		);
+		expect(tl.windows.map((w) => w.kickoff)).toEqual(["2026-11-08 13:00", "2026-11-08 16:25"]);
+		expect(tl.windows[0]!.pivots![0]!.options).toEqual([expect.stringContaining("Bench WR")]);
+
+		const { diffSnapshots, parseSince } = await import("../src/changes");
+		const a = { at: "", week: 9, players: { "1": { tag: "Questionable", practice: "Limited", proj: 12 }, "2": { proj: 10 } } };
+		const b = { at: "", week: 9, players: { "1": { tag: "Out", practice: "DNP", proj: 0 }, "2": { proj: 11 }, "3": {} } };
+		const d = diffSnapshots(a, b, ["1", "2", "3"]);
+		expect(d.find((x) => x.id === "1")!.changes).toEqual(["tag: Questionable -> Out", "practice: Limited -> DNP", "projection: 12 -> 0"]);
+		expect(d.find((x) => x.id === "2")).toBeUndefined();
+		expect(d.find((x) => x.id === "3")!.changes[0]).toContain("added");
+		expect(parseSince("3d", 10 * 86_400_000)).toBe(7 * 86_400_000);
+	});
+});
+
+describe("shortenedWeeks", () => {
+	it("drops injury exits from a baseline", () => {
+		const rows = [1, 2, 3, 4].map((week, i) => ({ week, offense_pct: [0.25, 0.98, 1, 0.97][i] }));
+		expect([...shortenedWeeks(rows)]).toEqual([1]);
+		expect(shortenedWeeks(rows.slice(0, 2)).size).toBe(0);
 	});
 });

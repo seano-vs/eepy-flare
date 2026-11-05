@@ -27,6 +27,13 @@ export interface Player {
 	exp?: number;
 	rank?: number;
 	status?: string;
+	/** Depth chart slot, e.g. "RB1" or "SWR1" (Sleeper's depth_chart_position + order; WRs are LWR/RWR/SWR). */
+	depth?: string;
+	/** When the current injury began (YYYY-MM-DD). */
+	injury_start?: string;
+	injury_body_part?: string;
+	/** false for retired/inactive players; undefined when the cache predates this field. */
+	active?: boolean;
 }
 
 const KV_ATTEMPT_KEY = "players:nfl:last_attempt";
@@ -118,8 +125,12 @@ export class PlayerDb {
 	get(id: string): Player | undefined {
 		const t = this.byId[id];
 		if (!t) return undefined;
-		const [name, pos, team, injury, age, exp, rank, status] = t;
+		const [name, pos, team, injury, age, exp, rank, status, depthPos, depthOrder, injStart, bodyPart, active] = t;
 		const p: Player = { id, name, pos, team };
+		if (depthOrder != null && team) p.depth = `${depthPos || pos}${depthOrder}`;
+		if (injStart && injury) p.injury_start = injStart;
+		if (bodyPart && injury) p.injury_body_part = bodyPart;
+		if (active != null) p.active = active === 1;
 		if (injury) p.injury = injury;
 		if (age != null) p.age = age;
 		if (exp != null) p.exp = exp;

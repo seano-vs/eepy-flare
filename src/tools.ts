@@ -15,11 +15,16 @@ import {
 } from "./scoring";
 import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
 import { READ_ONLY, fail, fmt, ok } from "./result";
-import { impliedTotals, injuryReportState, matchups, matchups as matchups_, playerContext, teamByes, type PlayerContext } from "./nflverse/context";
+import { impliedDelta, impliedNorms, impliedTotals, injuryReportState, isUnavailable, matchups, matchups as matchups_, playerContext, teamByes, type PlayerContext } from "./nflverse/context";
 import { registerNflTools } from "./nfl-tools";
 import { pickSchema, registerAdvisorTools, valuePicks } from "./advisor";
 import { registerLeagueTools } from "./league-tools";
 import { readPrefs } from "./prefs";
+import { gameWeather, type GameWeather } from "./weather";
+import { lockTimeline, type LockCandidate, type LockStarter } from "./locks";
+import { clock, eastern } from "./waivers";
+import { parseSince } from "./changes";
+import { NflData, sleeperTeam } from "./nflverse/stats";
 import { latestHeadlines, playerNews, practiceFromNews, roleSignal, type PracticeNews } from "./news";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { activeIds, computedRecords, loadSeason, recordString, runOdds } from "./playoffs";
@@ -28,7 +33,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.4.0";
+export const SERVER_VERSION = "1.5.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -177,12 +182,14 @@ export function createServer(env: Env): McpServer {
 				const pool = poolMap(poolArr);
 				const proj = (id: string) => pool.get(id)?.pts ?? (pool.size ? 0 : null);
 				const ids = r.players ?? [];
-				const [nflCtx, implied, matchup, reports, headlines] = await Promise.all([
+				const [nflCtx, implied, matchup, reports, headlines, weather, norms] = await Promise.all([
 					playerContext(lc, ids, { dynasty: isDynasty(lc.league), projections: new Map(ids.map((id) => [id, proj(id)])) }),
 					impliedTotals(lc, w),
 					matchups(lc, w),
 					injuryReportState(lc),
 					latestHeadlines(ids, 72),
+					w >= lc.week ? rosterWeather(lc, w, ids) : Promise.resolve(new Map<string, GameWeather>()),
+					impliedNorms(lc, w),
 				]);
 				// nflverse context per player: weekly consensus rank, injury report, team implied total, recent usage.
 				const extra = (id: string) => {
@@ -198,10 +205,15 @@ export function createServer(env: Env): McpServer {
 						...(c?.ecr?.week ? { ecr: c.ecr.week } : {}),
 						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 						...(c?.injury_report ? { injury_report: c.injury_report } : {}),
-						...(team && implied.has(team) ? { implied: implied.get(team) } : {}),
+						...(pl?.injury_start ? { injured_since: pl.injury_start } : {}),
+						...(pl?.depth ? { depth: pl.depth } : {}),
+						...(team && implied.has(team) ? { implied: implied.get(team), ...impliedDelta(implied.get(team), norms.get(team)) } : {}),
+						...(c?.play_pct != null ? { play_pct: c.play_pct, ...(c.play_note ? { play_note: c.play_note } : {}) } : {}),
 						...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
 						...(c?.role_change ? { role_change: c.role_change } : {}),
+				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
 						...(n ? { news: `${n.title} (${n.source}, ${n.age_hours}h ago)` } : {}),
+						...(team && weather.get(team)?.flags ? { weather: `${weather.get(team)!.flags!.join("; ")} (${weather.get(team)!.wind_mph} mph, ${weather.get(team)!.temp_f}F)` } : {}),
 						...(verify ? { verify } : {}),
 					};
 				};
@@ -247,6 +259,66 @@ export function createServer(env: Env): McpServer {
 								: {}),
 							note: "These teams' week reports aren't in nflverse yet (it updates a few times a day; the team may already have posted). No row doesn't mean healthy. practice_from_news is read from headlines.",
 						};
+					}
+				}
+				// Lock timeline: kickoffs for each starter, and later-game pivots for the ones at risk.
+				if (w === lc.week && pool.size) {
+					try {
+						const games = (await NflData.from(env, lc.season).games(w)).filter((g) => typeof g.home_score !== "number");
+						const kick = new Map<string, string>();
+						const shown = new Map<string, string>();
+						for (const g of games) {
+							const key = `${g.gameday} ${g.gametime}`;
+							const [hh, mm] = String(g.gametime ?? "00:00").split(":").map(Number);
+							shown.set(key, `${String(g.weekday ?? "").slice(0, 3)} ${clock(hh ?? 0, mm ?? 0)} ET`);
+							for (const t of [sleeperTeam(g.home_team), sleeperTeam(g.away_team)]) if (t) kick.set(t, key);
+						}
+						if (kick.size) {
+							const owned = lc.ownership();
+							const kickOf = (id: string) => kick.get(lc.players.get(id)?.team ?? "") ?? null;
+							const lockStarters: LockStarter[] = (r.starters ?? [])
+								.map((id, i) => ({ id, slot: slots[i] ?? "?" }))
+								.filter(({ id }) => id !== "0")
+								.map(({ id, slot }) => {
+									const pl = lc.players.get(id);
+									const c = nflCtx.get(id);
+									const k = kickOf(id);
+									const risk =
+										pl?.injury && /^(Questionable|Doubtful)$/.test(pl.injury)
+											? `listed ${pl.injury}${c?.play_pct != null ? ` (${c.play_pct}% play rate)` : ""}`
+											: c?.play_pct != null && c.play_pct < 90
+												? `${c.play_pct}% play rate`
+												: k && proj(id) === 0
+													? "projected 0"
+													: undefined;
+									return { slot, label: fmt(lc.ref(id)), pos: pl?.pos ?? "?", kickoff: k, proj: proj(id), ...(risk ? { risk } : {}) };
+								});
+							const benchIds = (r.players ?? []).filter((id) => !starterSet.has(id) && !reserve.has(id));
+							const fas = poolArr
+								.filter((e) => e.pts > 0 && !owned.has(e.id) && !isUnavailable(lc.players.get(e.id)))
+								.sort((a, b) => b.pts - a.pts)
+								.slice(0, 60)
+								.map((e) => e.id);
+							const cands: LockCandidate[] = [
+								...benchIds.map((id) => ({ id, source: "bench" as const })),
+								...fas.map((id) => ({ id, source: "free agent" as const })),
+							]
+								.filter(({ id }) => (proj(id) ?? 0) > 0 && !isUnavailable(lc.players.get(id)))
+								.map(({ id, source }) => ({ label: fmt(lc.ref(id)), pos: lc.players.get(id)?.pos ?? "?", kickoff: kickOf(id), proj: proj(id) ?? 0, source }));
+							const tl = lockTimeline(lockStarters, cands);
+							const pretty = (k: string) => shown.get(k) ?? k;
+							out.lock_timeline = {
+								windows: tl.windows.map((x) => ({
+									kickoff: pretty(x.kickoff),
+									starters: x.starters,
+									...(x.pivots ? { pivots: x.pivots.map((p) => ({ ...p, options: p.options.map((o) => o.replace(/kicks off (\d{4}-\d\d-\d\d \d\d:\d\d)/, (_m, k: string) => `kicks off ${pretty(k)}`)) })) } : {}),
+								})),
+								...(tl.no_game.length ? { no_game: tl.no_game } : {}),
+								note: "Each starter locks at his kickoff; inactives come out about 90 minutes before. Free-agent pivots must be free agents, not on waivers (players also lock onto waivers once their game starts).",
+							};
+						}
+					} catch (e) {
+						console.warn("lock timeline unavailable:", e instanceof Error ? e.message : e);
 					}
 				}
 				out.fetched_at = new Date().toISOString();
@@ -391,27 +463,37 @@ export function createServer(env: Env): McpServer {
 		"get_transactions",
 		{
 			title: "Transactions",
-			description: "League transactions (trades, waiver claims, free-agent adds/drops) for a week, newest first.",
+			description:
+				"League transactions (trades, waiver claims, free-agent adds/drops), newest first: for a week, or across weeks with since/until (one waiver run can land in two weeks' lists, so use since/until for 'what happened in the last run').",
 			inputSchema: z.object({
 				week: weekArg,
+				since: z.string().optional().describe("Only moves at or after this time: '24h', '3d' or an ISO time. Searches every week as needed (ignores week)."),
+				until: z.string().optional().describe("Only moves before this time (same formats; default now)."),
 				type: z.enum(["trade", "waiver", "free_agent"]).optional().describe("Only this transaction type."),
 				include_failed: z.boolean().optional().describe("Include failed/pending waiver claims. Default false."),
 				limit: z.number().int().min(1).max(200).optional().describe("Max transactions (default 50)."),
 			}),
 			annotations: READ_ONLY,
 		},
-		async ({ week, type, include_failed, limit }) => {
+		async ({ week, since, until, type, include_failed, limit }) => {
 			try {
 				const lc = await ctx();
 				const w = week ?? lc.week;
-				const txs = (await sleeper.transactions(lc.config.leagueId, w)) ?? [];
+				const from = since ? parseSince(since) : null;
+				const to = until ? parseSince(until) : null;
+				const at = (t: Transaction) => t.status_updated ?? t.created;
+				// A time range spans weeks: read every week up to the current one, then filter by time.
+				const txs =
+					from != null || to != null
+						? (await Promise.all(Array.from({ length: Math.max(1, lc.week) }, (_, i) => sleeper.transactions(lc.config.leagueId, i + 1).catch(() => [] as Transaction[])))).flat().filter((t) => (from == null || at(t) >= from) && (to == null || at(t) < to))
+						: ((await sleeper.transactions(lc.config.leagueId, w)) ?? []);
 				const list = txs
 					.filter((t) => (include_failed ? true : t.status === "complete"))
 					.filter((t) => (type ? t.type === type : true))
 					.sort((a, b) => (b.status_updated ?? b.created) - (a.status_updated ?? a.created))
 					.slice(0, limit ?? 50)
 					.map((t) => formatTransaction(lc, t));
-				return ok({ week: w, count: list.length, transactions: list });
+				return ok({ ...(from != null || to != null ? { since: from != null ? eastern(from) : null, until: to != null ? eastern(to) : "now" } : { week: w }), count: list.length, transactions: list });
 			} catch (e) {
 				return fail(e);
 			}
@@ -493,6 +575,7 @@ export function createServer(env: Env): McpServer {
 							...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
 							...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 							...(c?.role_change ? { role_change: c.role_change } : {}),
+				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
 							...(() => {
 								const h = heads.get(t.player_id);
 								const sig = h ? roleSignal(h.title) : null;
@@ -540,8 +623,16 @@ export function createServer(env: Env): McpServer {
 					.search({ name, team, position, limit: 500 })
 					.filter((p) => !available_only || !owned.has(p.id))
 					// Retired and unsigned players clutter results; keep them only on request or when rostered here.
-					.filter((p) => keepTeamless || !!p.team || owned.has(p.id));
-				const hidden = keepTeamless ? 0 : lc.players.search({ name, team, position, limit: 500 }).filter((p) => !p.team && !owned.has(p.id)).length;
+					.filter((p) => keepTeamless || ((!!p.team && p.active !== false) || owned.has(p.id)));
+				// Sleeper keeps some retired players on a team (Roethlisberger on PIT): hide those DynastyProcess
+				// lists as free agents and Sleeper has on no depth chart, unless rostered here.
+				if (!keepTeamless) {
+					const dpFa = await NflData.from(env, lc.season)
+						.dpFreeAgents(hits.filter((p) => p.team && !p.depth && !owned.has(p.id)).map((p) => p.id))
+						.catch(() => new Set<string>());
+					if (dpFa.size) hits = hits.filter((p) => !dpFa.has(p.id));
+				}
+				const hidden = keepTeamless ? 0 : lc.players.search({ name, team, position, limit: 500 }).filter((p) => (!p.team || p.active === false) && !owned.has(p.id)).length;
 				hits = hits.slice(0, n);
 				// Without a name, rank by this week's projection when we have one.
 				if (!name && pool.size) hits.sort((a, b) => (pool.get(b.id)?.pts ?? -1) - (pool.get(a.id)?.pts ?? -1));
@@ -552,6 +643,10 @@ export function createServer(env: Env): McpServer {
 						team: p.team ?? "FA",
 						...(p.injury ? { injury: p.injury } : {}),
 						...(p.age ? { age: p.age } : {}),
+				...(p.depth ? { depth: p.depth } : {}),
+				...(p.injury_start ? { injured_since: p.injury_start } : {}),
+						...(p.depth ? { depth: p.depth } : {}),
+						...(p.injury_start ? { injured_since: p.injury_start } : {}),
 						...(p.status ? { status: p.status } : {}),
 						league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
 						...(pool.size ? { proj_week: pool.get(p.id)?.pts ?? 0 } : {}),
@@ -577,11 +672,12 @@ export function createServer(env: Env): McpServer {
 		const ranks = positionRanks(pool);
 		const players = queries.map((q) => lc.players.resolve(q));
 		const nflCtxP = playerContext(lc, players.map((p) => p.id), { dynasty, projections: new Map(players.map((p) => [p.id, pool.find((e) => e.id === p.id)?.pts ?? (pool.length ? 0 : null)])) });
-		const [byes, matchup, implied, news] = await Promise.all([
+		const [byes, matchup, implied, news, norms] = await Promise.all([
 			teamByes(lc),
 			matchups(lc, w),
 			impliedTotals(lc, w),
 			Promise.all(players.map((p) => playerNews(p.id, { limit: 2, maxAgeHours: 7 * 24 }))),
+			impliedNorms(lc, w),
 		]);
 		const vals = await Promise.all(
 			players.map((p) =>
@@ -618,12 +714,14 @@ export function createServer(env: Env): McpServer {
 					const m = matchup(p.team, p.pos);
 					return m ? { vs: `${m.home ? "" : "@"}${m.opp}`, ...(m.def_rank ? { def_rank: m.def_rank } : {}) } : p.team && implied.size ? { vs: "BYE" } : {};
 				})(),
-				...(p.team && implied.has(p.team) ? { implied: implied.get(p.team) } : {}),
+				...(p.team && implied.has(p.team) ? { implied: implied.get(p.team), ...impliedDelta(implied.get(p.team), norms.get(p.team)) } : {}),
 				// FantasyPros consensus (a second opinion next to Sleeper's projections/ADP) and recent nflverse usage.
 				...(c?.ecr ? { consensus: c.ecr } : {}),
 				...(c?.recent ? { recent: c.recent } : {}),
 				...(c?.role_change ? { role_change: c.role_change } : {}),
+				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
 				...(c?.injury_report ? { injury_report: c.injury_report } : {}),
+				...(c?.play_pct != null ? { play_pct: c.play_pct } : {}),
 				...(news[i]!.length ? { news: news[i]!.map((n) => `${n.title} (${n.source}, ${n.age_hours}h ago)`) } : {}),
 			};
 		});
@@ -943,10 +1041,12 @@ function compactRecent(r: NonNullable<PlayerContext["recent"]>) {
 
 const CONTEXT_LEGEND =
 	"ecr = FantasyPros consensus positional rank this week (omitted until this week's rankings are published); ros_rank = rest-of-season rank. " +
-	"vs = this week's opponent (@ = away, BYE = no game); def_rank = that defense's rank in points allowed to the player's position this season (1 = most allowed, best matchup; 32 = toughest). implied = team's Vegas implied points. " +
+	"vs = this week's opponent (@ = away, BYE = no game); def_rank = that defense's rank in points allowed to the player's position this season (1 = most allowed, best matchup; 32 = toughest). implied = team's Vegas implied points; implied_vs_norm = that minus the team's average implied total this season (+3 or more historically adds ~0.7 pts, -3 or less costs ~1.0). " +
+	"play_pct = chance a Questionable player plays, from 2016-2025 base rates by last practice (DNP 50, Limited 75, Full 92; QBs 55; Doubtful ~10). " +
 	"recent = per-game over the last 3 weeks with stats: snap %, targets and target share, carries, rz_opps (red-zone targets + carries), " +
 	"pts under league scoring and xfp (expected points for that usage). injury_report = official report: status (injury), practice. " +
-	"role_change = usage that moved sharply in the last 3 weeks vs earlier, or a projection far from recent usage. news = latest headline in the last 72h (get_player_news for more).";
+	"role_change = usage trends: usage that moved sharply in the last 3 weeks vs earlier (context; injury-shortened games are left out of the baseline). projection_check = Sleeper's projection far from recent usage: check these before acting. news = latest headline in the last 72h (get_player_news for more). " +
+	"depth = Sleeper depth chart slot (RB1, QB2; WRs as LWR/RWR/SWR + order). injured_since = when the current injury began.";
 
 /**
  * A projection of 0 for a player whose team plays this week needs a reason before anyone
@@ -973,6 +1073,19 @@ const DYNASTY_HIDDEN = "Focus is win_now, so dynasty ADP and values are left out
 function withoutDynasty<T extends object>(row: T): T {
 	const { dynasty_adp: _a, dynasty_value: _v, ...rest } = row as T & { dynasty_adp?: unknown; dynasty_value?: unknown };
 	return rest as T;
+}
+
+/** Weather for the games your players are in (only outdoor games get a forecast). */
+async function rosterWeather(lc: LeagueContext, week: number, ids: string[]): Promise<Map<string, GameWeather>> {
+	try {
+		const teams = new Set(ids.map((id) => lc.players.get(id)?.team).filter(Boolean));
+		const games = (await NflData.from(lc.env, lc.season).games(week)).filter(
+			(g) => typeof g.home_score !== "number" && (teams.has(sleeperTeam(g.home_team) ?? "") || teams.has(sleeperTeam(g.away_team) ?? "")),
+		);
+		return await gameWeather(games);
+	} catch {
+		return new Map();
+	}
 }
 
 /** Prefer the record computed from matchup results; keep Sleeper's when it differs, so the lag is visible. */

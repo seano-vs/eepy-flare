@@ -50,6 +50,11 @@ function schemaStatements(): string[] {
 	return out;
 }
 
+/** Same column names, ignoring order. Exported for tests. */
+export function sameColumns(have: string[], want: string[]): boolean {
+	return have.length === want.length && want.every((c) => have.includes(c));
+}
+
 export async function ensureSchema(db: D1Database): Promise<void> {
 	await db.prepare("CREATE TABLE IF NOT EXISTS nfl_meta (key TEXT PRIMARY KEY, value TEXT)").run();
 	const current = await db.prepare("SELECT value FROM nfl_meta WHERE key = 'schema_version'").first<string>("value");
@@ -58,6 +63,19 @@ export async function ensureSchema(db: D1Database): Promise<void> {
 		// Fresh install or definitions changed: rebuild everything from upstream.
 		for (const d of DATASETS) stmts.push(`DROP TABLE IF EXISTS ${d.table}`);
 		stmts.push("DROP TABLE IF EXISTS nfl_chunk", "DROP TABLE IF EXISTS nfl_sync");
+	} else {
+		// One dataset's columns changed: rebuild only that table (and forget its ETags and chunk hashes).
+		const actual = await db.batch(DATASETS.map((d) => db.prepare(`SELECT name FROM pragma_table_info('${d.table}')`)));
+		for (const [i, d] of DATASETS.entries()) {
+			const have = ((actual[i]?.results ?? []) as { name: string }[]).map((r) => r.name);
+			if (have.length && !sameColumns(have, d.columns.map((c) => c.name))) {
+				stmts.push(
+					`DROP TABLE IF EXISTS ${d.table}`,
+					`DELETE FROM nfl_sync WHERE dataset = '${d.id}'`,
+					`DELETE FROM nfl_chunk WHERE dataset = '${d.id}' OR dataset LIKE '${d.id}:%'`,
+				);
+			}
+		}
 	}
 	stmts.push(...schemaStatements());
 	stmts.push(`INSERT OR REPLACE INTO nfl_meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')`);

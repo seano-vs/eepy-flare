@@ -50,7 +50,7 @@ export function round(n: number, places = 2): number {
 
 // ---------- Slots & replacement level ----------
 
-const SLOT_ELIGIBILITY: Record<string, readonly SkillPos[]> = {
+export const SLOT_ELIGIBILITY: Record<string, readonly SkillPos[]> = {
 	QB: ["QB"],
 	RB: ["RB"],
 	WR: ["WR"],
@@ -444,7 +444,7 @@ export async function valuePlayer(opts: {
 		injury: opts.injury,
 		status: opts.status,
 		rosPpg: v.ros_ppg,
-		seasonPts: v.season_pts,
+		seasonPts: seasonGames ? seasonPts : undefined, // unrounded, so the note matches season_ppg
 		seasonGames: v.season_games,
 	});
 	if (verify.length) v.verify = verify;

@@ -556,7 +556,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				for (const [id, c] of ctxAll) {
 					const proj = ppg.get(id)?.pts;
 					const x = c.recent?.xfp;
-					if (proj && x != null && c.role_change?.some((f) => f.includes("bigger role"))) discounted.set(id, Math.min(1, (proj + x) / 2 / proj));
+					if (proj && x != null && c.projection_check?.some((f) => f.includes("bigger role"))) discounted.set(id, Math.min(1, (proj + x) / 2 / proj));
 				}
 				for (const m of byWeek) for (const [id, f] of discounted) { const e = m.get(id); if (e) m.set(id, { ...e, pts: round(e.pts * f, 2) }); }
 				for (const [id, f] of discounted) { const e = ppg.get(id); if (e) ppg.set(id, { ...e, pts: round(e.pts * f, 2) }); }
@@ -618,6 +618,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 							player: fmt(lc.ref(id)),
 							...(c?.injury_report ? { injury_report: c.injury_report } : {}),
 							...(c?.role_change ? { role_change: c.role_change } : {}),
+							...(c?.projection_check ? { projection_check: c.projection_check } : {}),
 							...(h ? { news: `${h.title} (${h.source}, ${h.age_hours}h ago)` } : {}),
 							...(discounted.has(id) ? { projection_discounted: "Sleeper's projection assumes a bigger role than recent usage; scored halfway to recent expected points." } : {}),
 							// Sleeper projection per game in the weeks of the window he's projected to play.

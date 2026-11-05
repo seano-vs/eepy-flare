@@ -263,6 +263,8 @@ export const DATASETS: Dataset[] = [
 			text("roof"),
 			real("temp"),
 			real("wind"),
+			text("location"),
+			text("stadium"),
 		],
 		primaryKey: ["game_id"],
 		chunkBy: ["season", "week"],
