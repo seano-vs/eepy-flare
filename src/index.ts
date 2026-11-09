@@ -34,6 +34,19 @@ export default {
 	},
 
 	async scheduled(controller, env, ctx): Promise<void> {
+		if (controller.cron === INJURY_CRON) {
+			// Injury history on its own run (own CPU/memory budget): one season per run, 2013 onward,
+			// then the current season every 6 hours. Unfinished attempts are recorded and reported.
+			if (!env.NFL_DB) return;
+			ctx.waitUntil(
+				(async () => {
+					const lc = await LeagueContext.load(env);
+					const r = await syncInjuryHistory(env.NFL_DB, Number(lc.season));
+					if (r) console.log(`injury history ${r.season}: ${r.episodes} episodes, ${r.listings} listings`);
+				})(),
+			);
+			return;
+		}
 		if (controller.cron === PLAYERS_CRON) {
 			// Daily: Sleeper asks for at most one /players/nfl fetch per day.
 			ctx.waitUntil(
@@ -59,21 +72,6 @@ export default {
 				await LeagueContext.load(env)
 					.then((lc) => Promise.all([saveSnapshot(lc), recordReports(lc)]))
 					.catch((e) => console.error("snapshot failed", e));
-				// Injury history: up to 2 seasons per run (2013 onward), then the current season every 6 hours.
-				// (4 per run stalled in production after 6 seasons; unfinished attempts are recorded and reported.)
-				if (env.NFL_DB) {
-					try {
-						const lc = await LeagueContext.load(env);
-						const started = Date.now();
-						for (let i = 0; i < 2 && Date.now() - started < 20_000; i++) {
-							const r = await syncInjuryHistory(env.NFL_DB, Number(lc.season));
-							if (!r) break;
-							console.log(`injury history ${r.season}: ${r.episodes} episodes, ${r.listings} listings`);
-						}
-					} catch (e) {
-						console.error("injury history failed", e);
-					}
-				}
 				if (sync) throw sync;
 			})(),
 		);
@@ -82,6 +80,8 @@ export default {
 
 /** Must match the first cron in wrangler.jsonc. */
 const PLAYERS_CRON = "17 9 * * *";
+/** Must match the injury-history cron in wrangler.jsonc. */
+const INJURY_CRON = "41 * * * *";
 
 async function syncNflverse(env: Env): Promise<void> {
 	if (!env.NFL_DB) {

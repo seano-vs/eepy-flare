@@ -137,7 +137,7 @@ export async function asOf(lc: LeagueContext, sources: Source[], opts: AsOfOptio
 			const cur = rows?.results.find((r) => r.key === `injury_hist:${lc.season}`);
 			out.injury_history = seasons.length
 				? `nflverse, seasons ${seasons[0]}-${seasons[seasons.length - 1]} (${seasons.length} loaded)${cur ? `; ${lc.season} rebuilt ${stamp(cur.value, now, 7)}` : ""}`
-				: "not loaded yet (the hourly job backfills 2 seasons per run)";
+				: "not loaded yet (the hourly job backfills 1 season per run)";
 			if (unfinished.length) out.injury_history_problems = `started but didn't finish: ${unfinished.join("; ")}. A run that dies mid-season (memory or CPU limit) leaves this; after ${2} attempts a season is skipped.`;
 		}
 		const nflSources = (["injury_report", "lines", "rankings", "stats", "usage"] as Source[]).filter((s) => want.has(s));

@@ -25,7 +25,9 @@
 
   // 09:17 UTC daily: Sleeper players dump (Sleeper asks for at most one fetch per day).
   // :23 hourly: nflverse sync; unchanged files return 304 and are skipped.
-  "triggers": { "crons": ["17 9 * * *", "23 * * * *"] },
+  // Daily players cache, hourly nflverse sync, and the injury-history backfill on its own run
+  // (sharing the hourly run, it was killed partway through a second season).
+  "triggers": { "crons": ["17 9 * * *", "23 * * * *", "41 * * * *"] },
 
   "vars": {
     // Set these to your league and Sleeper user. Both are public numeric ids.

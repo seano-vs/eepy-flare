@@ -326,7 +326,9 @@ Since 1.6:
   - re-aggravation within 8 weeks;
   - his own past episodes, and severity words in the latest headline ("week-to-week", "MCL",
     "placed on injured reserve").
-  The hourly job loads up to 2 seasons per run and rebuilds the current season every 6 hours.
+  A separate hourly run at :41 loads one season at a time and rebuilds the current season
+  every 6 hours. It has its own run because sharing the :23 nflverse sync, a second season got the
+  run killed (production stopped at 2019 with 2020 unfinished).
   Files are read one at a time, keeping skill positions as they're parsed (the Worker has 128 MB),
   except snap counts: their position labels vary ("HB", "RB/W", "WR/R" in 2020), so filtering them
   would drop players like Joe Mixon. Each season's attempt is recorded before it starts. One that

@@ -35,7 +35,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.9.1";
+export const SERVER_VERSION = "1.9.2";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
