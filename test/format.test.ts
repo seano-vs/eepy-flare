@@ -2,13 +2,14 @@
 // an independent implementation (no shared code) that also reproduces them from Sleeper's own
 // weekly stats and nflverse's raw CSV: run
 //   node scripts/verify-format.mjs --through 9 --band 8 --fixture test/fixtures/qb-weeks-2026-w1-9.json
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { MARKET_STANDARD, MIN_BAND, REPLACEMENT_BAND, formatMultipliers } from "../src/format";
 import { leaguePoints } from "../src/nflverse/stats";
+import fixtureJson from "./fixtures/qb-weeks-2026-w1-9.json";
+import verifierSource from "../scripts/verify-format.mjs?raw";
 
 type Row = Record<string, unknown>;
-const fixture = JSON.parse(readFileSync(new URL("./fixtures/qb-weeks-2026-w1-9.json", import.meta.url), "utf8")) as Row[];
+const fixture = fixtureJson as Row[];
 
 /** This league's offensive scoring (get_league_settings, Nov 9 2026). */
 const LEAGUE = {
@@ -112,8 +113,7 @@ describe("formatMultipliers rules", () => {
 
 describe("verifier stays in sync", () => {
 	it("uses the same market standard as the server", () => {
-		const src = readFileSync(new URL("../scripts/verify-format.mjs", import.meta.url), "utf8");
-		const m = /const STANDARD = (\{[^}]+\})/.exec(src)!;
+		const m = /const STANDARD = (\{[^}]+\})/.exec(verifierSource)!;
 		const parsed = Function(`return (${m[1]})`)() as Record<string, number>;
 		expect(parsed).toEqual(MARKET_STANDARD);
 	});
