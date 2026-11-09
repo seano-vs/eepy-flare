@@ -230,3 +230,37 @@ describe("outlook text", () => {
 		expect(o.history).toEqual(["hamstring 2023 wk 5 (in game): missed 7, back wk 14 at 18% snaps"]);
 	});
 });
+
+describe("reading the mirrored report (D1 column names)", () => {
+	it("uses report_injury / practice_injury and splits this week from older rows", async () => {
+		const { reportBodies } = await import("../src/injuries/outlook");
+		// Rows as NflData.currentInjuries returns them from D1 (renamed from nflverse's *_primary_injury).
+		const rows = [
+			{ gsis_id: "00-0039067", week: 9, report_status: "", report_injury: "Hamstring", practice_injury: "Hamstring", practice_status: "Full Participation in Practice" },
+			{ gsis_id: "00-0036963", week: 9, report_status: "Questionable", report_injury: "", practice_injury: "Rib", practice_status: "Limited Participation in Practice" },
+			{ gsis_id: "00-0033119", week: 8, report_status: "Questionable", report_injury: "Elbow", practice_injury: "Elbow", practice_status: "Limited Participation in Practice" },
+			{ gsis_id: "00-0034869", week: 9, report_status: "", report_injury: "Not injury related - resting player", practice_injury: "", practice_status: "" },
+		];
+		const { current, stale } = reportBodies(rows, 9);
+		expect([...current]).toEqual([["00-0039067", "hamstring"], ["00-0036963", "rib"]]);
+		expect([...stale]).toEqual([["00-0033119", "elbow"]]);
+		// The nflverse file's raw names aren't in the mirror: nothing should be read from them.
+		expect(reportBodies([{ gsis_id: "x", week: 9, report_primary_injury: "Knee" }], 9).current.size).toBe(0);
+	});
+});
+
+describe("backfill scheduling", () => {
+	it("takes the oldest missing season, skips one that keeps failing, then refreshes the current season when stale", async () => {
+		const { nextSeason, FIRST_SEASON, MAX_ATTEMPTS } = await import("../src/injuries/sync");
+		const now = Date.parse("2026-11-09T16:00:00Z");
+		const done = new Map<number, string>();
+		for (let s = FIRST_SEASON; s <= 2018; s++) done.set(s, "2026-11-09T13:23:00Z");
+		expect(nextSeason(done, 2026, now)).toBe(2019);
+		expect(nextSeason(done, 2026, now, new Map([[2019, MAX_ATTEMPTS]]))).toBe(2020);
+		for (let s = 2019; s <= 2025; s++) done.set(s, "2026-11-09T13:23:00Z");
+		expect(nextSeason(done, 2026, now)).toBe(2026);
+		done.set(2026, "2026-11-09T14:00:00Z");
+		expect(nextSeason(done, 2026, now)).toBeNull(); // 2h old: fresh
+		expect(nextSeason(done, 2026, now + 5 * 3_600_000)).toBe(2026); // 7h old: stale
+	});
+});

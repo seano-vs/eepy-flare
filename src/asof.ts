@@ -83,7 +83,7 @@ export async function recordReports(lc: LeagueContext): Promise<void> {
 	const byTeamWeek = new Map<string, string[]>();
 	for (const r of rows) {
 		const k = `${sleeperTeam(r.team)}:${r.week}`;
-		byTeamWeek.set(k, [...(byTeamWeek.get(k) ?? []), `${r.gsis_id}|${r.report_status ?? ""}|${r.practice_status ?? ""}|${r.report_primary_injury ?? ""}`]);
+		byTeamWeek.set(k, [...(byTeamWeek.get(k) ?? []), `${r.gsis_id}|${r.report_status ?? ""}|${r.practice_status ?? ""}|${r.report_injury ?? ""}|${r.practice_injury ?? ""}`]);
 	}
 	const stored = await lc.env.PLAYERS.get<Record<string, ReportSeen>>(REPORT_KEY(lc.season), "json");
 	const prev = stored ?? {};
@@ -129,10 +129,16 @@ export async function asOf(lc: LeagueContext, sources: Source[], opts: AsOfOptio
 		if (want.has("injury_history") && lc.env.NFL_DB) {
 			const rows = await lc.env.NFL_DB.prepare("SELECT key, value FROM nfl_meta WHERE key LIKE 'injury_hist:%'").all<{ key: string; value: string }>().catch(() => null);
 			const seasons = (rows?.results ?? []).map((r) => Number(r.key.split(":")[1])).sort((a, b) => a - b);
+			const stuck = await lc.env.NFL_DB.prepare("SELECT key, value FROM nfl_meta WHERE key LIKE 'injury_hist_attempt:%'").all<{ key: string; value: string }>().catch(() => null);
+			const unfinished = (stuck?.results ?? []).map((r) => {
+				const [n, at] = r.value.split("|");
+				return `${r.key.split(":")[1]} (${n} unfinished attempt${n === "1" ? "" : "s"}, last ${stamp(at, now)})`;
+			});
 			const cur = rows?.results.find((r) => r.key === `injury_hist:${lc.season}`);
 			out.injury_history = seasons.length
 				? `nflverse, seasons ${seasons[0]}-${seasons[seasons.length - 1]} (${seasons.length} loaded)${cur ? `; ${lc.season} rebuilt ${stamp(cur.value, now, 7)}` : ""}`
-				: "not loaded yet (the hourly job backfills 4 seasons per run)";
+				: "not loaded yet (the hourly job backfills 2 seasons per run)";
+			if (unfinished.length) out.injury_history_problems = `started but didn't finish: ${unfinished.join("; ")}. A run that dies mid-season (memory or CPU limit) leaves this; after ${2} attempts a season is skipped.`;
 		}
 		const nflSources = (["injury_report", "lines", "rankings", "stats", "usage"] as Source[]).filter((s) => want.has(s));
 		if (nflSources.length && lc.env.NFL_DB) {

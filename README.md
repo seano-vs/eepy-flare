@@ -326,7 +326,15 @@ Since 1.6:
   - re-aggravation within 8 weeks;
   - his own past episodes, and severity words in the latest headline ("week-to-week", "MCL",
     "placed on injured reserve").
-  The hourly job loads up to 4 seasons per run and rebuilds the current season every 6 hours.
+  The hourly job loads up to 2 seasons per run and rebuilds the current season every 6 hours.
+  Files are read one at a time, keeping skill positions as they're parsed (the Worker has 128 MB),
+  except snap counts: their position labels vary ("HB", "RB/W", "WR/R" in 2020), so filtering them
+  would drop players like Joe Mixon. Each season's attempt is recorded before it starts. One that
+  never finishes shows in `as_of.injury_history_problems`, and is skipped after 2 attempts.
+- **1.9.1 fixes.** Outlooks read the mirrored report's `report_injury` / `practice_injury`
+  columns. 1.9.0 used nflverse's raw names, so only Sleeper-tagged players got an outlook. Sleeper's
+  current body part now comes before the week's report, which predates that week's game. The
+  report-change log hashes the same corrected columns.
 - **How the injury numbers were checked.** The episodes were compared against public record
   (Jefferson, Kupp, Burrow, Rodgers and Chase in 2022-23, McCaffrey 2021, Henry 2021, Barkley
   2020). A separate Python implementation reproduced the listing outcomes row for row from the

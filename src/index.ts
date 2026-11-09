@@ -59,12 +59,13 @@ export default {
 				await LeagueContext.load(env)
 					.then((lc) => Promise.all([saveSnapshot(lc), recordReports(lc)]))
 					.catch((e) => console.error("snapshot failed", e));
-				// Injury history: up to 4 seasons per run (2013 onward, ~1-2 s each), then the current season every 6 hours.
+				// Injury history: up to 2 seasons per run (2013 onward), then the current season every 6 hours.
+				// (4 per run stalled in production after 6 seasons; unfinished attempts are recorded and reported.)
 				if (env.NFL_DB) {
 					try {
 						const lc = await LeagueContext.load(env);
 						const started = Date.now();
-						for (let i = 0; i < 4 && Date.now() - started < 20_000; i++) {
+						for (let i = 0; i < 2 && Date.now() - started < 20_000; i++) {
 							const r = await syncInjuryHistory(env.NFL_DB, Number(lc.season));
 							if (!r) break;
 							console.log(`injury history ${r.season}: ${r.episodes} episodes, ${r.listings} listings`);

@@ -13,8 +13,13 @@ const NFLVERSE = "https://github.com/nflverse/nflverse-data/releases/download";
 export const FIRST_SEASON = 2013;
 /** Bump when the injury tables or the episode logic change: tables are dropped and the backfill restarts. */
 export const INJURY_SCHEMA_VERSION = "2";
-/** A season's files must have at least this many rows, or the run fails instead of storing gaps. */
-const MIN_ROWS = { injuries: 1000, snaps: 5000, stats: 3000, rosters: 5000 };
+/**
+ * A season's files must have at least this many skill-position rows, or the run fails instead of
+ * storing gaps (2012's snap file is an empty stub). Low enough for a season half played.
+ */
+const MIN_ROWS = { injuries: 300, snaps: 2000, stats: 1500, rosters: 2000 };
+/** Positions kept at parse time (FB so fullbacks can be recognized and excluded). */
+const KEEP_POS = new Set(["QB", "RB", "WR", "TE", "FB"]);
 const CURRENT_REFRESH_MS = 6 * 3_600_000;
 
 export const INJURY_SCHEMA = [
@@ -32,7 +37,7 @@ export const INJURY_SCHEMA = [
 
 const COLS = {
 	injuries: ["season", "game_type", "team", "week", "gsis_id", "position", "full_name", "report_primary_injury", "report_status", "practice_primary_injury", "practice_status", "date_modified"],
-	snaps: ["game_type", "week", "pfr_player_id", "player", "team", "offense_snaps", "offense_pct"],
+	snaps: ["game_type", "week", "pfr_player_id", "player", "position", "team", "offense_snaps", "offense_pct"],
 	stats: ["player_id", "week", "season_type", "position", "player_display_name"],
 	rosters: ["gsis_id", "pfr_id", "week", "game_type", "team", "status_description_abbr", "position", "depth_chart_position", "full_name"],
 };
@@ -50,13 +55,16 @@ async function fetchOk(url: string): Promise<Response | null> {
 /** CSV rows as objects with only `cols`; tries .csv.gz then .csv (2012's injury file is plain). */
 async function csvRows(path: string, cols: string[]): Promise<Record<string, string>[]> {
 	try {
-		return await csvRowsInner(path, cols);
+		// Snap files label positions loosely ("HB", "RB/W", "WR/R": Joe Mixon in 2020), so they aren't
+		// filtered; the injury and stats files use QB/RB/WR/TE in every season 2013-2026.
+		return await csvRowsInner(path, cols, path.startsWith("snap_counts/") ? null : "position");
 	} catch (e) {
 		throw new Error(`${path}: ${e instanceof Error ? e.message : String(e)}`);
 	}
 }
 
-async function csvRowsInner(path: string, cols: string[]): Promise<Record<string, string>[]> {
+/** Rows with only `cols`, keeping skill positions as they're parsed (memory: the Worker has 128 MB). */
+async function csvRowsInner(path: string, cols: string[], positionCol: string | null): Promise<Record<string, string>[]> {
 	const gz = await fetchOk(`${NFLVERSE}/${path}.csv.gz`);
 	let text: string | null = null;
 	if (gz?.body) {
@@ -68,25 +76,28 @@ async function csvRowsInner(path: string, cols: string[]): Promise<Record<string
 		if (!res) throw new Error("not published");
 		text = await res.text();
 	}
-	const { rows } = parseCsvColumns(text, cols);
+	// Blank positions are kept too (stats files have ~20 a season), so no player can be dropped by a missing label.
+	const { rows } = parseCsvColumns(text, cols, positionCol ? { column: positionCol, accept: (v) => v === "" || KEEP_POS.has(v) } : undefined);
+	text = null;
 	return rows.map((r) => Object.fromEntries(cols.map((c, i) => [c, r[i] ?? ""])));
 }
 
 async function rosterRows(season: number): Promise<Record<string, unknown>[]> {
 	const res = await fetchOk(`${NFLVERSE}/weekly_rosters/roster_weekly_${season}.parquet`);
 	if (!res) throw new Error(`injury history: rosters ${season} not published`);
-	const rows = (await parquetReadObjects({ file: await res.arrayBuffer(), columns: COLS.rosters })) as Record<string, unknown>[];
+	const all = (await parquetReadObjects({ file: await res.arrayBuffer(), columns: COLS.rosters })) as Record<string, unknown>[];
+	const rows = all.filter((r) => KEEP_POS.has(String(r.position)) || r.depth_chart_position === "FB");
+	all.length = 0;
 	for (const r of rows) for (const k of COLS.rosters) if (typeof r[k] === "bigint") r[k] = Number(r[k]);
 	return rows;
 }
 
 export async function loadSeasonRaw(season: number): Promise<SeasonRaw> {
-	const [injuries, snaps, stats, rosters] = await Promise.all([
-		csvRows(`injuries/injuries_${season}`, COLS.injuries),
-		csvRows(`snap_counts/snap_counts_${season}`, COLS.snaps),
-		csvRows(`stats_player/stats_player_week_${season}`, COLS.stats),
-		rosterRows(season),
-	]);
+	// One file at a time, so each file's text can be freed before the next is downloaded.
+	const injuries = await csvRows(`injuries/injuries_${season}`, COLS.injuries);
+	const snaps = await csvRows(`snap_counts/snap_counts_${season}`, COLS.snaps);
+	const stats = await csvRows(`stats_player/stats_player_week_${season}`, COLS.stats);
+	const rosters = await rosterRows(season);
 	const raw = { injuries, snaps, stats, rosters };
 	for (const [k, min] of Object.entries(MIN_ROWS)) {
 		const n = raw[k as keyof SeasonRaw].length;
@@ -131,12 +142,19 @@ export function seasonStatements(season: number, eps: Episode[], listings: Listi
 		...inserts("nfl_injury_listings", ["season", "gsis_id", "week", "position", "body", "status", "practice", "played"], listings.map((l) => [l.season, l.id, l.week, l.position, l.body, l.status, l.practice, l.played])),
 		...inserts("nfl_injury_norms", ["season", "gsis_id", "norm"], [...norms].map(([id, n]) => [season, id, n])),
 		`INSERT OR REPLACE INTO nfl_meta (key, value) VALUES ('injury_hist:${season}', '${new Date().toISOString()}')`,
+		`DELETE FROM nfl_meta WHERE key = 'injury_hist_attempt:${season}'`,
 	];
 }
 
-/** Which season to process this run: the oldest missing historical season, else the current one if stale. Pure. */
-export function nextSeason(done: Map<number, string>, current: number, now = Date.now()): number | null {
-	for (let s = FIRST_SEASON; s < current; s++) if (!done.has(s)) return s;
+/** Failed attempts after which a historical season is skipped so the rest can load. */
+export const MAX_ATTEMPTS = 2;
+
+/**
+ * Which season to process this run: the oldest missing historical season (skipping one that has
+ * already failed MAX_ATTEMPTS times), else the current one if stale. Pure; exported for tests.
+ */
+export function nextSeason(done: Map<number, string>, current: number, now = Date.now(), attempts: Map<number, number> = new Map()): number | null {
+	for (let s = FIRST_SEASON; s < current; s++) if (!done.has(s) && (attempts.get(s) ?? 0) < MAX_ATTEMPTS) return s;
 	const at = done.get(current);
 	return !at || now - Date.parse(at) > CURRENT_REFRESH_MS ? current : null;
 }
@@ -155,10 +173,16 @@ export async function syncInjuryHistory(db: D1Database, currentSeason: number, o
 		]);
 	}
 	await db.batch(INJURY_SCHEMA.map((s) => db.prepare(s)));
-	const meta = await db.prepare("SELECT key, value FROM nfl_meta WHERE key LIKE 'injury_hist:%'").all<{ key: string; value: string }>();
-	const done = new Map(meta.results.map((r) => [Number(r.key.split(":")[1]), r.value]));
-	const season = opts.season ?? nextSeason(done, currentSeason);
+	const meta = await db.prepare("SELECT key, value FROM nfl_meta WHERE key LIKE 'injury_hist%'").all<{ key: string; value: string }>();
+	const done = new Map(meta.results.filter((r) => r.key.startsWith("injury_hist:")).map((r) => [Number(r.key.split(":")[1]), r.value]));
+	// Attempts that never finished (the run was killed, e.g. over the memory limit) are counted here.
+	const attempts = new Map(meta.results.filter((r) => r.key.startsWith("injury_hist_attempt:")).map((r) => [Number(r.key.split(":")[1]), Number(r.value.split("|")[0]) || 0]));
+	const season = opts.season ?? nextSeason(done, currentSeason, Date.now(), attempts);
 	if (season == null) return null;
+	await db
+		.prepare("INSERT OR REPLACE INTO nfl_meta (key, value) VALUES (?, ?)")
+		.bind(`injury_hist_attempt:${season}`, `${(attempts.get(season) ?? 0) + 1}|${new Date().toISOString()}`)
+		.run();
 	const priorRows = await db.prepare("SELECT gsis_id, norm FROM nfl_injury_norms WHERE season = ?").bind(season - 1).all<{ gsis_id: string; norm: number }>();
 	const prior = new Map(priorRows.results.map((r) => [r.gsis_id, r.norm]));
 	const players = buildSeason(season, await loadSeasonRaw(season), prior, season < currentSeason);

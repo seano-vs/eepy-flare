@@ -147,6 +147,21 @@ export function outlookFrom(body: string, rates: Rates | null, history: HistoryR
 }
 
 /**
+ * Body part per gsis id from the mirrored report (D1 nfl_injuries columns report_injury /
+ * practice_injury, renamed from nflverse's report_primary_injury), split into this week's rows
+ * and older ones. Pure; exported for tests.
+ */
+export function reportBodies(rows: Record<string, unknown>[], week: number): { current: Map<string, string>; stale: Map<string, string> } {
+	const current = new Map<string, string>();
+	const stale = new Map<string, string>();
+	for (const r of rows) {
+		const b = normalizeBody(String(r.report_injury || r.practice_injury || ""));
+		if (b) (Number(r.week) === week ? current : stale).set(String(r.gsis_id), b);
+	}
+	return { current, stale };
+}
+
+/**
  * Outlooks for currently injured players (Sleeper tag, or this week's report). Body part from
  * the current report row, else Sleeper's injury_body_part. Empty when the history isn't loaded.
  */
@@ -158,14 +173,7 @@ export async function injuryOutlooks(lc: LeagueContext, sleeperIds: string[], he
 		const nfl = NflData.from(lc.env, lc.season);
 		const ids = await nfl.ids(sleeperIds);
 		const cur = await nfl.currentInjuries();
-		// This week's report row wins; Sleeper's body part beats an older report row (Drew Lock, week 9:
-		// Seattle's report wasn't mirrored yet and the week-8 row still said elbow; he'd hurt his oblique).
-		const reportBody = new Map<string, string>();
-		const staleBody = new Map<string, string>();
-		for (const r of cur.rows) {
-			const b = normalizeBody(String(r.report_primary_injury || r.practice_primary_injury || ""));
-			if (b) (Number(r.week) === cur.week ? reportBody : staleBody).set(String(r.gsis_id), b);
-		}
+		const { current: reportBody, stale: staleBody } = reportBodies(cur.rows, cur.week);
 		const injured = sleeperIds.filter((id) => {
 			const p = lc.players.get(id);
 			const g = ids.get(id)?.gsis_id;
@@ -178,7 +186,10 @@ export async function injuryOutlooks(lc: LeagueContext, sleeperIds: string[], he
 			injured.map(async (id) => {
 				const p = lc.players.get(id)!;
 				const g = ids.get(id)?.gsis_id;
-				const body = (g ? reportBody.get(g) : undefined) ?? normalizeBody(p.injury_body_part ?? "") ?? (g ? staleBody.get(g) : undefined) ?? null;
+				// Sleeper's tag (refreshed daily) is newest: the week's report predates that week's game, where
+				// players get hurt (Lock's week-9 report said elbow; he hurt his oblique in the game). Then the
+				// mirrored report: this week's rows, then older ones.
+				const body = normalizeBody(p.injury ? (p.injury_body_part ?? "") : "") ?? (g ? (reportBody.get(g) ?? staleBody.get(g)) : undefined) ?? null;
 				const h = (g ? hist.get(g) : undefined) ?? [];
 				const n = headlines.get(id);
 				const sev = n ? severityFromText(`${n.title} ${n.summary ?? ""}`) : [];
