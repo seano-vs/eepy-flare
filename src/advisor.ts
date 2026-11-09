@@ -4,7 +4,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { asOf } from "./asof";
-import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
+import { dynastyAdp, dynastyMarket, dynastyValue, isDynasty } from "./dynasty";
 import { LeagueContext } from "./league";
 import { isUnavailable, playerContext } from "./nflverse/context";
 import { waiverSchedule, waiverStatuses } from "./waivers";
@@ -216,11 +216,11 @@ async function pickOwnership(lc: LeagueContext): Promise<(season: string, round:
 
 export async function valuePicks(lc: LeagueContext, picks: PickSpec[], sideRosterId: number | undefined): Promise<ValuedPick[]> {
 	if (!picks.length) return [];
-	const adp = await dynastyAdp(lc.env.PLAYERS, lc.league);
-	// This year's rookie class at current dynasty market value.
-	const rookieValues = Object.entries(adp)
-		.filter(([id]) => lc.players.get(id)?.exp === 0)
-		.map(([, a]) => dynastyValue(a));
+	const [adp, market] = await Promise.all([dynastyAdp(lc.env.PLAYERS, lc.league), dynastyMarket(lc).catch(() => null)]);
+	// This year's rookie class at current dynasty market value (same blend as players).
+	const rookieValues = Object.keys(adp)
+		.filter((id) => lc.players.get(id)?.exp === 0)
+		.map((id) => market?.get(id)?.value ?? dynastyValue(adp[id]));
 	const teams = lc.league.total_rosters;
 	const order = draftOrder(lc);
 	const owner = await pickOwnership(lc);
@@ -511,7 +511,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const usePlayoffs = windowArg === "playoffs" && playoffStart > lc.week;
 				const [{ ppg, current, weeks: window, byWeek }, adp, season] = await Promise.all([
 					usePlayoffs ? nearTermPpg(lc, playoffStart, Math.max(1, lastFantasyWeek(lc.league) - playoffStart + 1)) : nearTermPpg(lc, lc.week, 3),
-					dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>),
+					dynasty ? dynastyMarket(lc).catch(() => null) : Promise.resolve(null),
 					loadSeason(lc),
 				]);
 				// Partner outlook from playoff odds: a 4-4 team with 50% odds is a bubble team, not a rebuilder.
@@ -530,7 +530,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					const p = ppg.get(id);
 					const pos = p?.pos ?? lc.players.get(id)?.pos ?? "?";
 					const r = repl?.level[pos as SkillPos] ?? 0;
-					return { id, pos, ppg: p?.pts ?? 0, games: p?.games ?? 0, ros_vor: round(Math.max(0, (p?.pts ?? 0) - r) * weeksLeft, 1), dynasty_value: dynasty ? dynastyValue(adp[id]) : 0 };
+					return { id, pos, ppg: p?.pts ?? 0, games: p?.games ?? 0, ros_vor: round(Math.max(0, (p?.pts ?? 0) - r) * weeksLeft, 1), dynasty_value: dynasty ? (adp?.get(id)?.value ?? 0) : 0 };
 				};
 				const active = (r: Roster) => {
 					const res = new Set([...(r.reserve ?? []), ...(r.taxi ?? [])]);

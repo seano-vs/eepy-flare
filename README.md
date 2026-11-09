@@ -289,6 +289,13 @@ Since 1.6:
 - **RotoBaller times (1.6.1).** Sleeper's feed stores RotoBaller's Eastern wall-clock time as if it
   were UTC, so those items read 4–5 hours early (a Week 8 recap stamped 11:31 AM ET on game day).
   They're reinterpreted as New York time, unless that would put them in the future.
+- **Dynasty value (1.7).** `dynasty_value` is now the average of two superflex sources on the same
+  rank-to-value curve: Sleeper's superflex dynasty ADP (the draft market) and FantasyPros'
+  superflex dynasty consensus rank (experts, from the nflverse mirror). Sleeper's market runs far
+  below the experts on QBs (Purdy: ADP 47.6 vs rank 15), which made QB trades look lopsided.
+  Either source alone is used when only one ranks a player, and FantasyPros is dropped when its
+  scrape is more than 7 days old. `dynasty_sources` shows both; rookie values for draft picks
+  use the same blend.
 - **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
   that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
   from the original owner's standing (worst record picks first). `traded_picks` determines who owns

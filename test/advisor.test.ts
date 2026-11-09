@@ -76,3 +76,17 @@ describe("value-based bids", () => {
 		expect(reserveFor(100, 0)).toBe(10);
 	});
 });
+
+describe("blendDynasty", () => {
+	it("averages Sleeper ADP and FantasyPros superflex rank values, or uses whichever exists", async () => {
+		const { blendDynasty, dynastyValue } = await import("../src/dynasty");
+		const adp = { purdy: 47.6, deep: 300 };
+		const fp = new Map([["purdy", 15], ["fpOnly", 40]]);
+		const p = blendDynasty(adp, fp, "purdy")!;
+		expect(p.value).toBe(Math.round((dynastyValue(47.6) + dynastyValue(15)) / 2));
+		expect(p.fantasypros_sf_rank).toBe(15);
+		expect(blendDynasty(adp, fp, "deep")!.value).toBe(dynastyValue(300));
+		expect(blendDynasty(adp, fp, "fpOnly")!.value).toBe(dynastyValue(40));
+		expect(blendDynasty(adp, fp, "nobody")).toBeUndefined();
+	});
+});

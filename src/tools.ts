@@ -14,7 +14,7 @@ import {
 	type ProjectedEntry,
 	type Replacement,
 } from "./scoring";
-import { dynastyAdp, dynastyValue, isDynasty } from "./dynasty";
+import { dynastyAdp, dynastyMarket, isDynasty } from "./dynasty";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { impliedDelta, impliedNorms, impliedTotals, injuryReportState, isUnavailable, matchups, matchups as matchups_, playerContext, teamByes, type PlayerContext } from "./nflverse/context";
 import { registerNflTools } from "./nfl-tools";
@@ -34,7 +34,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.6.1";
+export const SERVER_VERSION = "1.7.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -670,7 +670,8 @@ export function createServer(env: Env): McpServer {
 			replacementFor(lc, w),
 			dynasty ? dynastyAdp(env.PLAYERS, lc.league) : Promise.resolve({} as Record<string, number>),
 		]);
-		const hasAdp = Object.keys(adp).length > 0;
+		const market = dynasty ? await dynastyMarket(lc).catch(() => null) : null;
+		const hasAdp = !!market?.any;
 		const owned = lc.ownership();
 		const ranks = positionRanks(pool);
 		const players = queries.map((q) => lc.players.resolve(q));
@@ -711,7 +712,15 @@ export function createServer(env: Env): McpServer {
 				...(p.status ? { status: p.status } : {}),
 				...(ranks.has(p.id) ? { week_pos_rank: ranks.get(p.id) } : {}),
 				...(vals[i] ?? { projection: "unavailable" }),
-				...(hasAdp ? { dynasty_adp: adp[p.id] ?? null, dynasty_value: dynastyValue(adp[p.id]) } : {}),
+				...(hasAdp
+					? (() => {
+							const m = market!.get(p.id);
+							return {
+								dynasty_value: m?.value ?? 0,
+								...(m ? { dynasty_sources: { ...(m.sleeper_adp != null ? { sleeper_sf_adp: m.sleeper_adp, sleeper_value: m.sleeper_value } : {}), ...(m.fantasypros_sf_rank != null ? { fantasypros_sf_rank: m.fantasypros_sf_rank, fantasypros_value: m.fantasypros_value } : {}) } } : {}),
+							};
+						})()
+					: {}),
 				// Matchup context, same as get_my_roster.
 				...(() => {
 					const m = matchup(p.team, p.pos);
@@ -728,7 +737,7 @@ export function createServer(env: Env): McpServer {
 				...(news[i]!.length ? { news: news[i]!.map((n) => newsLine(n)) } : {}),
 			};
 		});
-		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp };
+		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp, fantasypros_used: !!market?.fantasypros_used, fantasypros_scraped: market?.fantasypros_scraped ?? null };
 	}
 
 	server.registerTool(
@@ -936,7 +945,7 @@ export function createServer(env: Env): McpServer {
 						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled: " +
 						"the verdicts are only as good as Sleeper's projections, so check each player's verify list and current news before acting." +
 						(v.dynasty && !hide
-							? " dynasty_value = market value from Sleeper dynasty ADP (10000 = 1st overall); it is additive, so it overrates trading one star for several depth pieces. " +
+							? " dynasty_value = long-term market value (10000 = 1st overall): the average of Sleeper's superflex dynasty ADP and FantasyPros' superflex dynasty rank on the same curve (either alone when only one ranks the player; FantasyPros is dropped when its scrape is over 7 days old). dynasty_sources shows both. It is additive, so it overrates trading one star for several depth pieces. " +
 								"A pick is valued as this year's rookie drafted at that overall slot (current dynasty value), minus 10% per extra year out; slot defaults to the original owner's current standing."
 							: ""),
 				});
@@ -1074,7 +1083,7 @@ const DYNASTY_HIDDEN = "Focus is win_now, so dynasty ADP and values are left out
 
 /** Drop the dynasty market fields from a valuation row. */
 function withoutDynasty<T extends object>(row: T): T {
-	const { dynasty_adp: _a, dynasty_value: _v, ...rest } = row as T & { dynasty_adp?: unknown; dynasty_value?: unknown };
+	const { dynasty_adp: _a, dynasty_value: _v, dynasty_sources: _s, ...rest } = row as T & { dynasty_adp?: unknown; dynasty_value?: unknown; dynasty_sources?: unknown };
 	return rest as T;
 }
 

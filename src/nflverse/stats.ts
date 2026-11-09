@@ -166,6 +166,21 @@ export class NflData {
 		return out;
 	}
 
+	/** FantasyPros superflex dynasty rank per Sleeper id (page dynasty-op), with its scrape date. */
+	async dynastySf(): Promise<{ ranks: Map<string, number>; scraped: string | null }> {
+		const rows = await this.all<{ sleeper_id: string; rank: number; scrape_date: string }>(
+			`SELECT i.sleeper_id, e.rank, e.scrape_date FROM nfl_ecr e JOIN nfl_player_ids i ON i.fantasypros_id = e.fantasypros_id
+			 WHERE e.page = 'dynasty-op' AND i.sleeper_id IS NOT NULL AND e.rank IS NOT NULL`,
+		);
+		const ranks = new Map<string, number>();
+		let scraped: string | null = null;
+		for (const r of rows) {
+			if (!ranks.has(r.sleeper_id) || r.rank < ranks.get(r.sleeper_id)!) ranks.set(r.sleeper_id, r.rank);
+			if (r.scrape_date && (!scraped || r.scrape_date > scraped)) scraped = r.scrape_date;
+		}
+		return { ranks, scraped };
+	}
+
 	/** Most recent FantasyPros scrape date in the mirror. */
 	async ecrDate(): Promise<string | null> {
 		const r = await this.all<{ d: string | null }>("SELECT MAX(scrape_date) AS d FROM nfl_ecr");
