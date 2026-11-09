@@ -296,15 +296,21 @@ Since 1.6:
   it tracks preseason redraft ADP (r = 0.92) and lags breakouts and injuries (Purdy 47.6 vs
   FantasyPros 15; Omarion Hampton 20.9 vs 72 at 9 ppg). It also runs low on QBs across the board
   (Mahomes 37 vs 14): QBs average 838 value points below FantasyPros, RBs 626 above.
-- **League format (1.8).** The market rankings assume full PPR, 4-pt passing TDs and no TE premium
+- **League format (1.8.1).** The market rankings assume full PPR, 4-pt passing TDs and no TE premium
   or first-down points. For each position, eepy scores this season's games (nflverse, players
-  with 4+ games) under the league's rules and under that standard, and compares the average
-  points above replacement among starters (replacement = the next player after the league's
-  starter count). The ratio scales that position's market value: `dynasty_value` is the adjusted
-  value, `dynasty_market_value` the raw blend, `format_multiplier` the ratio, and
-  `format_adjustment` in `compare_players` / `evaluate_trade` shows the inputs. In this league
-  (6-pt passing TDs) QBs get ×1.113 as of week 9: 6-pt scoring raises raw QB points about 19%,
-  but the replacement QB gains almost as much, so value above replacement rises 11%.
+  with 4+ games) under the league's rules and under that standard, and compares the starters'
+  average points above replacement. Replacement is the average of the 8 players after the
+  league's starter count. A single replacement player made the result depend on one player's TD
+  mix: QB came out anywhere from x1.12 to x1.46 week to week and x1.40 one starter later. The band
+  held x1.23-1.25 over weeks 7-9 and within 0.02 for starters +/- 2. Fewer than 3 players after the
+  starters means no adjustment. In this league QBs get x1.248 through week 9; RB/WR/TE stay x1.
+  `dynasty_value` is the adjusted value, `dynasty_market_value` the raw blend, `format_multiplier`
+  the ratio, and `format_adjustment` in `compare_players` / `evaluate_trade` shows the inputs.
+- **Checking the multipliers.** `node scripts/verify-format.mjs --through 9 --band 8` recomputes
+  them with no shared code, from Sleeper's weekly stats and from nflverse's raw CSV, prints how
+  they move with the starter count, and exits 1 on `--expect QB=1.248` mismatches.
+  `test/format.test.ts` pins the server's results on a fixture of real 2026 QB weeks to the values
+  that script computes from the same file, plus hand-computed cases.
   Either source alone is used when only one ranks a player, and FantasyPros is dropped when its
   scrape is more than 7 days old. `dynasty_sources` shows both; rookie values for draft picks
   use the same blend.

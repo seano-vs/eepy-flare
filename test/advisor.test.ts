@@ -94,19 +94,3 @@ describe("blendDynasty", () => {
 		expect(blendDynasty(adp, fp, "nobody")).toBeUndefined();
 	});
 });
-
-describe("formatMultipliers", () => {
-	it("scales QBs by points above replacement when passing TDs are worth 6", async () => {
-		const { formatMultipliers } = await import("../src/format");
-		// Three QBs over 4 games each: 2, 1 and 0.5 TDs a game, 250 yards; one RB.
-		const rows = [] as Record<string, unknown>[];
-		for (const [id, td] of [["a", 2], ["b", 1], ["c", 0.5]] as const) for (let w = 1; w <= 4; w++) rows.push({ gsis_id: id, position: "QB", week: w, passing_yards: 250, passing_tds: td });
-		for (let w = 1; w <= 4; w++) rows.push({ gsis_id: "r", position: "RB", week: w, rushing_yards: 80, receptions: 3 });
-		const league = { pass_yd: 0.04, pass_td: 6, rush_yd: 0.1, rec: 1 };
-		const out = formatMultipliers(rows, league, { QB: 2, RB: 0, WR: 0, TE: 0 });
-		// Standard (4-pt): ppg 18/14/12, repl 12, PAR (6+2)/2 = 4. League (6-pt): 22/16/13, repl 13, PAR (9+3)/2 = 6.
-		expect(out.multipliers.QB).toBe(1.5);
-		expect(out.by_position.QB!.above_replacement_ppg).toEqual({ league: 6, standard: 4 });
-		expect(out.multipliers.RB).toBe(1);
-	});
-});

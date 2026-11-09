@@ -28,11 +28,23 @@ export const MARKET_STANDARD: Record<string, number> = {
 
 const POSITIONS: SkillPos[] = ["QB", "RB", "WR", "TE"];
 /** Games needed for a player to count (a few snaps in one game shouldn't set replacement). */
-const MIN_GAMES = 4;
+export const MIN_GAMES = 4;
+/**
+ * Replacement = the average of this many players after the starters, not the single next one.
+ * One player's touchdown mix decides a single-player replacement: through week 9 of 2026 that
+ * gave QB x1.116, but x1.399 one starter later and anywhere from x1.12 to x1.46 week to week.
+ * An 8-player band held x1.23-1.25 across weeks 7-9 and within 0.02 for starters +/- 2
+ * (scripts/verify-format.mjs, which recomputes it from Sleeper's and nflverse's raw stats).
+ */
+export const REPLACEMENT_BAND = 8;
+/** With fewer than this many players after the starters, the position isn't adjusted (x1). */
+export const MIN_BAND = 3;
 
 export interface PositionFormat {
 	multiplier: number;
 	starters: number;
+	/** Players averaged for replacement (up to REPLACEMENT_BAND). */
+	replacement_band: number;
 	replacement_ppg: { league: number; standard: number };
 	above_replacement_ppg: { league: number; standard: number };
 }
@@ -67,10 +79,11 @@ export function formatMultipliers(rows: Row[], league: Record<string, number>, s
 	for (const pos of POSITIONS) {
 		const n = starters[pos] ?? 0;
 		const players = [...acc.values()].filter((a) => a.pos === pos && a.g >= MIN_GAMES);
-		if (!n || players.length <= n) continue;
+		const band = Math.min(REPLACEMENT_BAND, players.length - n);
+		if (!n || band < MIN_BAND) continue;
 		const side = (k: "lg" | "st") => {
 			const ppg = players.map((a) => a[k] / a.g).sort((x, y) => y - x);
-			const repl = ppg[n]!;
+			const repl = ppg.slice(n, n + band).reduce((s, x) => s + x, 0) / band;
 			return { repl, par: ppg.slice(0, n).reduce((s, x) => s + (x - repl), 0) / n };
 		};
 		const lg = side("lg");
@@ -81,6 +94,7 @@ export function formatMultipliers(rows: Row[], league: Record<string, number>, s
 		by_position[pos] = {
 			multiplier: m,
 			starters: n,
+			replacement_band: band,
 			replacement_ppg: { league: round(lg.repl, 1), standard: round(st.repl, 1) },
 			above_replacement_ppg: { league: round(lg.par, 2), standard: round(st.par, 2) },
 		};
@@ -109,7 +123,7 @@ export async function leagueFormat(lc: LeagueContext): Promise<FormatAdjustment 
 	const adj: FormatAdjustment = {
 		...core,
 		standard: "full PPR, 4-pt passing TDs, no TE premium or first-down points (what the market rankings assume)",
-		based_on: `weeks 1-${latest} of ${lc.season}, players with ${MIN_GAMES}+ games; replacement = next player after the league's starter count`,
+		based_on: `weeks 1-${latest} of ${lc.season}, players with ${MIN_GAMES}+ games; replacement = average of the ${REPLACEMENT_BAND} players after the league's starter count (no adjustment with fewer than ${MIN_BAND})`,
 	};
 	memo.set(key, { at: Date.now(), adj });
 	return adj;
