@@ -19,6 +19,28 @@ export interface NewsItem {
 	summary?: string;
 }
 
+/** Sources whose feed time is Eastern wall-clock time stored as if it were UTC. */
+const EASTERN_AS_UTC = new Set(["rotoballer"]);
+
+/** Milliseconds New York is behind UTC at instant `t` (5h in winter, 4h in summer). */
+function nyOffsetMs(t: number): number {
+	const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric", hourCycle: "h23" }).formatToParts(new Date(t));
+	const g = (k: string) => Number(p.find((x) => x.type === k)?.value);
+	return t - Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"), new Date(t).getUTCMilliseconds());
+}
+
+/**
+ * Correct a feed timestamp. RotoBaller items in Sleeper's feed are Eastern wall time stored as UTC
+ * (recaps stamped before kickoff, e.g. a Week 8 recap at 11:31 AM ET on game day), so they read
+ * 4-5 hours early. Reinterpret the UTC wall time as New York time; if that lands in the future,
+ * the feed was right (or has been fixed) and the raw time is kept. Pure; exported for tests.
+ */
+export function fixPublished(ms: number, source: string, now = Date.now()): number {
+	if (!EASTERN_AS_UTC.has(source)) return ms;
+	const fixed = ms + nyOffsetMs(ms + 5 * 3_600_000);
+	return fixed > now + 10 * 60_000 ? ms : fixed;
+}
+
 /** Parse Sleeper's news payload defensively (exported for tests). */
 export function parseNews(data: unknown, now = Date.now()): NewsItem[] {
 	if (!Array.isArray(data)) return [];
@@ -27,8 +49,9 @@ export function parseNews(data: unknown, now = Date.now()): NewsItem[] {
 		if (!x || typeof x !== "object") continue;
 		const r = x as { published?: unknown; source?: unknown; metadata?: { title?: unknown; url?: unknown; description?: unknown } };
 		const title = typeof r.metadata?.title === "string" ? r.metadata.title.trim() : "";
-		const ms = typeof r.published === "number" ? r.published : Number(r.published);
-		if (!title || !Number.isFinite(ms)) continue;
+		const raw = typeof r.published === "number" ? r.published : Number(r.published);
+		if (!title || !Number.isFinite(raw)) continue;
+		const ms = fixPublished(raw, typeof r.source === "string" ? r.source : "", now);
 		const summary = typeof r.metadata?.description === "string" ? r.metadata.description.trim() : "";
 		out.push({
 			title,

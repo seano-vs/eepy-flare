@@ -286,6 +286,9 @@ Since 1.6:
 - **Derived numbers name their basis.** `play_basis` says which designation, practice and report
   week a `play_pct` came from, or that it's preliminary.
 - `injury_tags_as_of`, `projections_fetched_at` and `fetched_at` are replaced by `as_of`.
+- **RotoBaller times (1.6.1).** Sleeper's feed stores RotoBaller's Eastern wall-clock time as if it
+  were UTC, so those items read 4–5 hours early (a Week 8 recap stamped 11:31 AM ET on game day).
+  They're reinterpreted as New York time, unless that would put them in the future.
 - **Draft picks.** A pick is valued at the current dynasty value of this year's rookie drafted at
   that overall slot, minus 10% for each extra year out. Without an explicit slot, the slot comes
   from the original owner's standing (worst record picks first). `traded_picks` determines who owns

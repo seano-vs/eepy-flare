@@ -232,3 +232,17 @@ describe("freshness stamps", () => {
 		expect(newsLine({ ...n!, also: ["fantasy_pros"] })).toBe("Rice limited Wednesday (rotowire +fantasy_pros, Wed, Nov 4, 9:14 PM ET, 12h ago)");
 	});
 });
+
+describe("fixPublished", () => {
+	it("reads RotoBaller's feed time as Eastern wall time", async () => {
+		const { fixPublished } = await import("../src/news");
+		const now = Date.parse("2026-11-09T12:00:00Z");
+		// Mayfield's Week 8 recap: feed says 16:31Z (11:31 AM ET, before kickoff); really 4:31 PM ET.
+		expect(new Date(fixPublished(Date.parse("2026-11-01T16:31:00Z"), "rotoballer", now)).toISOString()).toBe("2026-11-01T21:31:00.000Z");
+		// Summer time is 4 hours.
+		expect(new Date(fixPublished(Date.parse("2026-10-25T19:20:00Z"), "rotoballer", now)).toISOString()).toBe("2026-10-25T23:20:00.000Z");
+		// Other sources and would-be-future times are untouched.
+		expect(fixPublished(Date.parse("2026-11-01T16:31:00Z"), "rotowire", now)).toBe(Date.parse("2026-11-01T16:31:00Z"));
+		expect(fixPublished(now - 60_000, "rotoballer", now)).toBe(now - 60_000);
+	});
+});
