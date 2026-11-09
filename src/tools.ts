@@ -34,7 +34,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.7.1";
+export const SERVER_VERSION = "1.8.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -717,6 +717,7 @@ export function createServer(env: Env): McpServer {
 							const m = market!.get(p.id);
 							return {
 								dynasty_value: m?.value ?? 0,
+								...(m?.format_multiplier ? { dynasty_market_value: m.market_value, format_multiplier: m.format_multiplier } : {}),
 								...(m ? { dynasty_sources: { ...(m.sleeper_adp != null ? { sleeper_sf_adp: m.sleeper_adp, sleeper_value: m.sleeper_value } : {}), ...(m.fantasypros_sf_rank != null ? { fantasypros_sf_rank: m.fantasypros_sf_rank, fantasypros_value: m.fantasypros_value } : {}) } } : {}),
 							};
 						})()
@@ -737,7 +738,7 @@ export function createServer(env: Env): McpServer {
 				...(news[i]!.length ? { news: news[i]!.map((n) => newsLine(n)) } : {}),
 			};
 		});
-		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp, fantasypros_used: !!market?.fantasypros_used, fantasypros_scraped: market?.fantasypros_scraped ?? null };
+		return { week: w, through_week: Math.max(w, through), repl, rows, vals, players, dynasty: dynasty && hasAdp, fantasypros_used: !!market?.fantasypros_used, fantasypros_scraped: market?.fantasypros_scraped ?? null, format: market?.format ?? null };
 	}
 
 	server.registerTool(
@@ -803,6 +804,7 @@ export function createServer(env: Env): McpServer {
 					best_this_week: byWeek[0]?.player,
 					best_rest_of_season: byRos[0]?.player,
 					...(hide ? { dynasty_hidden: DYNASTY_HIDDEN } : {}),
+						...(!hide && v.dynasty && v.format && Object.values(v.format.multipliers).some((m) => m !== 1) ? { format_adjustment: { multipliers: v.format.multipliers, by_position: v.format.by_position, standard: v.format.standard, based_on: v.format.based_on } } : {}),
 					...(v.dynasty && !hide
 						? { best_dynasty: [...v.rows].sort((a, b) => num(b, "dynasty_value") - num(a, "dynasty_value"))[0]?.player }
 						: {}),
@@ -930,6 +932,7 @@ export function createServer(env: Env): McpServer {
 					},
 					...(v.dynasty && !hide ? { verdict: { win_now: verdict, long_term: dynastyVerdict } } : { verdict }),
 					...(hide ? { dynasty_hidden: DYNASTY_HIDDEN } : {}),
+						...(!hide && v.dynasty && v.format && Object.values(v.format.multipliers).some((m) => m !== 1) ? { format_adjustment: { multipliers: v.format.multipliers, by_position: v.format.by_position, standard: v.format.standard, based_on: v.format.based_on } } : {}),
 					...(pool.size
 						? {
 								lineup_this_week: {
@@ -945,7 +948,7 @@ export function createServer(env: Env): McpServer {
 						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled: " +
 						"the verdicts are only as good as Sleeper's projections, so check each player's verify list and current news before acting." +
 						(v.dynasty && !hide
-							? " dynasty_value = long-term market value (10000 = 1st overall): FantasyPros' superflex dynasty rank and Sleeper's superflex dynasty ADP on the same curve, weighted 80/20 toward FantasyPros in-season (50/50 offseason), because draft ADP lags in-season changes and runs low on QBs. Either alone when only one ranks the player; FantasyPros is dropped when its scrape is over 7 days old. dynasty_sources shows both. It is additive, so it overrates trading one star for several depth pieces. " +
+							? " dynasty_value = long-term market value (10000 = 1st overall): FantasyPros' superflex dynasty rank and Sleeper's superflex dynasty ADP on the same curve, weighted 80/20 toward FantasyPros in-season (50/50 offseason), because draft ADP lags in-season changes and runs low on QBs. Either alone when only one ranks the player; FantasyPros is dropped when its scrape is over 7 days old. That market value is then scaled per position for this league's scoring (format_multiplier; dynasty_market_value is the unscaled value): points above replacement under league scoring vs the standard the rankings assume (PPR, 4-pt pass TDs), from this season's games. dynasty_sources shows both. It is additive, so it overrates trading one star for several depth pieces. " +
 								"A pick is valued as this year's rookie drafted at that overall slot (current dynasty value), minus 10% per extra year out; slot defaults to the original owner's current standing."
 							: ""),
 				});
@@ -1083,7 +1086,13 @@ const DYNASTY_HIDDEN = "Focus is win_now, so dynasty ADP and values are left out
 
 /** Drop the dynasty market fields from a valuation row. */
 function withoutDynasty<T extends object>(row: T): T {
-	const { dynasty_adp: _a, dynasty_value: _v, dynasty_sources: _s, ...rest } = row as T & { dynasty_adp?: unknown; dynasty_value?: unknown; dynasty_sources?: unknown };
+	const { dynasty_adp: _a, dynasty_value: _v, dynasty_sources: _s, dynasty_market_value: _m, format_multiplier: _f, ...rest } = row as T & {
+		dynasty_adp?: unknown;
+		dynasty_value?: unknown;
+		dynasty_sources?: unknown;
+		dynasty_market_value?: unknown;
+		format_multiplier?: unknown;
+	};
 	return rest as T;
 }
 

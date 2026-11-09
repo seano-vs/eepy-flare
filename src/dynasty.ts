@@ -8,6 +8,8 @@
 
 import type { LeagueContext } from "./league";
 import { NflData } from "./nflverse/stats";
+import { leagueFormat, type FormatAdjustment } from "./format";
+import type { SkillPos } from "./scoring";
 import type { League } from "./sleeper";
 import { sleeper } from "./sleeper";
 import { PROJECTED_POSITIONS } from "./scoring";
@@ -78,8 +80,12 @@ export async function dynastyAdp(kv: KVNamespace, league: League): Promise<Recor
 // ---------------------------------------------------------------- blended market value
 
 export interface DynastyMarket {
-	/** Blended value: FantasyPros' superflex rank value and Sleeper's ADP value, weighted (see FP_WEIGHT). */
+	/** Value for this league: the market value scaled by the league-format multiplier for the position. */
 	value: number;
+	/** Market value before the format adjustment: FantasyPros and Sleeper, weighted (see FP_WEIGHT). */
+	market_value?: number;
+	/** Multiplier applied for this league's scoring vs the market's standard (omitted when 1). */
+	format_multiplier?: number;
 	sleeper_adp?: number;
 	sleeper_value?: number;
 	fantasypros_sf_rank?: number;
@@ -117,8 +123,8 @@ export function blendDynasty(adp: Record<string, number>, fpRanks: Map<string, n
 const marketMemo = new Map<string, { at: number; fp: Map<string, number>; scraped: string | null }>();
 
 /** Market lookup for a league: id -> blended value (undefined if neither source has the player). */
-export async function dynastyMarket(lc: LeagueContext): Promise<{ get: (id: string) => DynastyMarket | undefined; fantasypros_used: boolean; fantasypros_weight: number; fantasypros_scraped: string | null; any: boolean }> {
-	const adp = await dynastyAdp(lc.env.PLAYERS, lc.league);
+export async function dynastyMarket(lc: LeagueContext): Promise<{ get: (id: string) => DynastyMarket | undefined; fantasypros_used: boolean; fantasypros_weight: number; fantasypros_scraped: string | null; any: boolean; format: FormatAdjustment | null }> {
+	const [adp, format] = await Promise.all([dynastyAdp(lc.env.PLAYERS, lc.league), leagueFormat(lc).catch(() => null)]);
 	let fp = new Map<string, number>();
 	let scraped: string | null = null;
 	const superflex = adpField(lc.league) === "adp_dynasty_2qb";
@@ -135,5 +141,11 @@ export async function dynastyMarket(lc: LeagueContext): Promise<{ get: (id: stri
 	const fresh = scraped != null && Date.now() - Date.parse(`${scraped}T12:00:00Z`) <= FP_MAX_AGE_DAYS * 86_400_000;
 	const ranks = fresh ? fp : new Map<string, number>();
 	const w = lc.league.status === "in_season" ? FP_WEIGHT.in_season : FP_WEIGHT.offseason;
-	return { get: (id) => blendDynasty(adp, ranks, id, w), fantasypros_used: fresh && ranks.size > 0, fantasypros_weight: fresh && ranks.size > 0 ? w : 0, fantasypros_scraped: scraped, any: Object.keys(adp).length > 0 || ranks.size > 0 };
+	const get = (id: string): DynastyMarket | undefined => {
+		const b = blendDynasty(adp, ranks, id, w);
+		if (!b) return undefined;
+		const m = format?.multipliers[lc.players.get(id)?.pos as SkillPos] ?? 1;
+		return m === 1 ? { ...b, market_value: b.value } : { ...b, market_value: b.value, value: Math.round(b.value * m), format_multiplier: m };
+	};
+	return { get, format, fantasypros_used: fresh && ranks.size > 0, fantasypros_weight: fresh && ranks.size > 0 ? w : 0, fantasypros_scraped: scraped, any: Object.keys(adp).length > 0 || ranks.size > 0 };
 }
