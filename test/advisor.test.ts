@@ -84,6 +84,10 @@ describe("blendDynasty", () => {
 		const fp = new Map([["purdy", 15], ["fpOnly", 40]]);
 		const p = blendDynasty(adp, fp, "purdy")!;
 		expect(p.value).toBe(Math.round((dynastyValue(47.6) + dynastyValue(15)) / 2));
+		// In-season weighting toward FantasyPros puts Purdy above Taylor (Sleeper ADP 22, FP 27).
+		const both = { ...adp, taylor: 22 };
+		const ranks = new Map([...fp, ["taylor", 27]]);
+		expect(blendDynasty(both, ranks, "purdy", 0.8)!.value).toBeGreaterThan(blendDynasty(both, ranks, "taylor", 0.8)!.value);
 		expect(p.fantasypros_sf_rank).toBe(15);
 		expect(blendDynasty(adp, fp, "deep")!.value).toBe(dynastyValue(300));
 		expect(blendDynasty(adp, fp, "fpOnly")!.value).toBe(dynastyValue(40));

@@ -1,11 +1,10 @@
 // Dynasty valuation.
 //
 // Rest-of-season VOR says nothing about next year, so dynasty leagues also get a
-// long-term market value: Sleeper's dynasty ADP (superflex ADP in superflex leagues,
-// from the undocumented season-projections endpoint) blended with FantasyPros'
-// superflex dynasty consensus ranks from the nflverse mirror. Sleeper's draft market
-// runs well below the experts on QBs (Purdy: ADP 47.6 vs FantasyPros rank 15), so
-// either alone skews superflex trades. If both fail, tools omit the dynasty fields.
+// long-term market value: FantasyPros' superflex dynasty consensus ranks (nflverse
+// mirror) blended with Sleeper's dynasty ADP (superflex ADP in superflex leagues, from
+// the undocumented season-projections endpoint), weighted toward FantasyPros in-season
+// (see FP_WEIGHT). If both fail, tools omit the dynasty fields.
 
 import type { LeagueContext } from "./league";
 import { NflData } from "./nflverse/stats";
@@ -79,13 +78,23 @@ export async function dynastyAdp(kv: KVNamespace, league: League): Promise<Recor
 // ---------------------------------------------------------------- blended market value
 
 export interface DynastyMarket {
-	/** Blended value: the average of Sleeper's ADP value and FantasyPros' superflex rank value when both exist. */
+	/** Blended value: FantasyPros' superflex rank value and Sleeper's ADP value, weighted (see FP_WEIGHT). */
 	value: number;
 	sleeper_adp?: number;
 	sleeper_value?: number;
 	fantasypros_sf_rank?: number;
 	fantasypros_value?: number;
 }
+
+/**
+ * FantasyPros' share of the blend. Sleeper's dynasty ADP comes from drafts, which mostly happen
+ * before the season: in-season it tracks redraft ADP (r = 0.92 on Nov 9) and lags breakouts and
+ * injuries (Purdy ADP 47.6 vs FantasyPros 15; Omarion Hampton 20.9 vs 72 at 9 ppg). It also sits
+ * below the experts on QBs across the board (Mahomes 37 vs 14, Lawrence 35 vs 13): QBs average
+ * 838 value points below FantasyPros, RBs 626 above. The expert ranks update weekly, so they get
+ * most of the weight during the season and half in the offseason, when draft data is fresh.
+ */
+export const FP_WEIGHT = { in_season: 0.8, offseason: 0.5 };
 
 /** FantasyPros ranks older than this are ignored (the upstream scrape sometimes stalls). */
 const FP_MAX_AGE_DAYS = 7;
@@ -95,20 +104,20 @@ const FP_MAX_AGE_DAYS = 7;
  * consensus rank (experts), both on the same rank-to-value curve. Either alone when only one
  * covers the player. Pure; exported for tests.
  */
-export function blendDynasty(adp: Record<string, number>, fpRanks: Map<string, number>, id: string): DynastyMarket | undefined {
+export function blendDynasty(adp: Record<string, number>, fpRanks: Map<string, number>, id: string, fpWeight = 0.5): DynastyMarket | undefined {
 	const a = adp[id];
 	const r = fpRanks.get(id);
 	const sv = a != null ? dynastyValue(a) : undefined;
 	const fv = r != null ? dynastyValue(r) : undefined;
 	if (sv == null && fv == null) return undefined;
-	const value = sv != null && fv != null ? Math.round((sv + fv) / 2) : (sv ?? fv)!;
+	const value = sv != null && fv != null ? Math.round(fpWeight * fv + (1 - fpWeight) * sv) : (sv ?? fv)!;
 	return { value, ...(a != null ? { sleeper_adp: a, sleeper_value: sv } : {}), ...(r != null ? { fantasypros_sf_rank: r, fantasypros_value: fv } : {}) };
 }
 
 const marketMemo = new Map<string, { at: number; fp: Map<string, number>; scraped: string | null }>();
 
 /** Market lookup for a league: id -> blended value (undefined if neither source has the player). */
-export async function dynastyMarket(lc: LeagueContext): Promise<{ get: (id: string) => DynastyMarket | undefined; fantasypros_used: boolean; fantasypros_scraped: string | null; any: boolean }> {
+export async function dynastyMarket(lc: LeagueContext): Promise<{ get: (id: string) => DynastyMarket | undefined; fantasypros_used: boolean; fantasypros_weight: number; fantasypros_scraped: string | null; any: boolean }> {
 	const adp = await dynastyAdp(lc.env.PLAYERS, lc.league);
 	let fp = new Map<string, number>();
 	let scraped: string | null = null;
@@ -125,5 +134,6 @@ export async function dynastyMarket(lc: LeagueContext): Promise<{ get: (id: stri
 	}
 	const fresh = scraped != null && Date.now() - Date.parse(`${scraped}T12:00:00Z`) <= FP_MAX_AGE_DAYS * 86_400_000;
 	const ranks = fresh ? fp : new Map<string, number>();
-	return { get: (id) => blendDynasty(adp, ranks, id), fantasypros_used: fresh && ranks.size > 0, fantasypros_scraped: scraped, any: Object.keys(adp).length > 0 || ranks.size > 0 };
+	const w = lc.league.status === "in_season" ? FP_WEIGHT.in_season : FP_WEIGHT.offseason;
+	return { get: (id) => blendDynasty(adp, ranks, id, w), fantasypros_used: fresh && ranks.size > 0, fantasypros_weight: fresh && ranks.size > 0 ? w : 0, fantasypros_scraped: scraped, any: Object.keys(adp).length > 0 || ranks.size > 0 };
 }

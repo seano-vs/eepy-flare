@@ -34,7 +34,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.7.0";
+export const SERVER_VERSION = "1.7.1";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -777,7 +777,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Compare players",
 			description:
-				"Compare 2-8 players under this league's scoring: this week's projection (start/sit), rest-of-season points and value over replacement, and in dynasty leagues long-term value from Sleeper dynasty ADP. " +
+				"Compare 2-8 players under this league's scoring: this week's projection (start/sit), rest-of-season points and value over replacement, and in dynasty leagues long-term market value (FantasyPros superflex dynasty ranks blended with Sleeper dynasty ADP, weighted 80/20 toward FantasyPros in-season). " +
 				"These are Sleeper's estimates: when players are within a couple of points, decide on role, health and matchup rather than the gap, and check each player's verify list.",
 			inputSchema: z.object({
 				players: z.array(z.string()).min(2).max(8).describe("Names or Sleeper ids."),
@@ -818,7 +818,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Evaluate trade",
 			description:
-				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (Sleeper dynasty ADP, plus draft picks) and gives separate win-now and long-term verdicts. " +
+				"Evaluate a trade under this league's scoring: rest-of-season projected points and value over replacement given vs received (superflex-aware, so QBs carry their real value), plus the effect on this week's optimal lineup for both teams. In dynasty leagues it also compares long-term market value (FantasyPros superflex dynasty ranks blended with Sleeper dynasty ADP, weighted 80/20 toward FantasyPros in-season, plus draft picks) and gives separate win-now and long-term verdicts. " +
 				"The verdicts inherit Sleeper's projections and ADP, which lag injuries, suspensions and role changes: before pitching a trade, check each player's verify list and current news, " +
 				"and check trade_review_days (get_league_settings) before saying it helps this week.",
 			inputSchema: z.object({
@@ -945,7 +945,7 @@ export function createServer(env: Env): McpServer {
 						"VOR = projected points above a replacement-level starter at the same position, summed over remaining weeks. Roster-spot cost of 2-for-1 deals and injuries/news are not modeled: " +
 						"the verdicts are only as good as Sleeper's projections, so check each player's verify list and current news before acting." +
 						(v.dynasty && !hide
-							? " dynasty_value = long-term market value (10000 = 1st overall): the average of Sleeper's superflex dynasty ADP and FantasyPros' superflex dynasty rank on the same curve (either alone when only one ranks the player; FantasyPros is dropped when its scrape is over 7 days old). dynasty_sources shows both. It is additive, so it overrates trading one star for several depth pieces. " +
+							? " dynasty_value = long-term market value (10000 = 1st overall): FantasyPros' superflex dynasty rank and Sleeper's superflex dynasty ADP on the same curve, weighted 80/20 toward FantasyPros in-season (50/50 offseason), because draft ADP lags in-season changes and runs low on QBs. Either alone when only one ranks the player; FantasyPros is dropped when its scrape is over 7 days old. dynasty_sources shows both. It is additive, so it overrates trading one star for several depth pieces. " +
 								"A pick is valued as this year's rookie drafted at that overall slot (current dynasty value), minus 10% per extra year out; slot defaults to the original owner's current standing."
 							: ""),
 				});
