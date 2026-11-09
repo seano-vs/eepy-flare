@@ -113,6 +113,23 @@ function parseFull(text: string): { header: string[]; rows: string[][] } {
  * them, so this is several times cheaper than materialising every field.
  * Returns rows with values in `wanted` order ("" for columns absent from the header).
  */
+/**
+ * The slow path's full rows, reduced to `wanted` in that order with the prefilter applied, so
+ * callers get the same shape either way. (It used to return every column in file order, which
+ * silently misread any file with a quoted field spanning lines, e.g. nflverse injury files.)
+ */
+function selectColumns(full: { header: string[]; rows: string[][] }, wanted: string[], prefilter?: { column: string; accept: (value: string) => boolean }): { header: string[]; rows: string[][] } {
+	const col = new Map(full.header.map((h, i) => [h, i]));
+	const targets = wanted.map((w) => col.get(w) ?? -1);
+	const f = prefilter ? (col.get(prefilter.column) ?? -1) : -1;
+	const rows: string[][] = [];
+	for (const r of full.rows) {
+		if (f >= 0 && !prefilter!.accept(r[f] ?? "")) continue;
+		rows.push(targets.map((t) => (t >= 0 ? (r[t] ?? "") : "")));
+	}
+	return { header: full.header, rows };
+}
+
 export function parseCsvColumns(
 	text: string,
 	wanted: string[],
@@ -150,7 +167,7 @@ export function parseCsvColumns(
 					let q = p + 1;
 					for (;;) {
 						q = text.indexOf('"', q);
-						if (q === -1 || q >= lineEnd) return parseFull(text); // spans lines: give up on the fast path
+						if (q === -1 || q >= lineEnd) return selectColumns(parseFull(text), wanted, prefilter); // spans lines: slow path
 						if (text.charCodeAt(q + 1) === 34) q += 2;
 						else break;
 					}
@@ -174,6 +191,13 @@ export function parseCsvColumns(
 				}
 				field++;
 				p = next + 1;
+			}
+			// A quoted field past the last wanted column (or past a prefilter skip) can still span
+			// lines: an odd number of quotes in the unread rest of the line means it does.
+			if (p <= lineEnd) {
+				let quotes = 0;
+				for (let q = text.indexOf('"', p); q !== -1 && q < lineEnd; q = text.indexOf('"', q + 1)) quotes++;
+				if (quotes % 2 === 1) return selectColumns(parseFull(text), wanted, prefilter);
 			}
 			if (!skip) rows.push(targets.map((t) => (t >= 0 ? (found.get(t) ?? "") : "")));
 		}

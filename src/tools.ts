@@ -26,7 +26,8 @@ import { lockTimeline, type LockCandidate, type LockStarter } from "./locks";
 import { clock, eastern } from "./waivers";
 import { parseSince } from "./changes";
 import { NflData, sleeperTeam } from "./nflverse/stats";
-import { latestHeadlines, newsLine, playerNews, practiceFromNews, practiceLine, type PracticeNews, roleSignal } from "./news";
+import { injuryOutlooks } from "./injuries/outlook";
+import { type NewsItem, latestHeadlines, newsLine, playerNews, practiceFromNews, practiceLine, type PracticeNews, roleSignal } from "./news";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { activeIds, computedRecords, loadSeason, recordString, runOdds } from "./playoffs";
 import { sleeper, type Roster, type Transaction } from "./sleeper";
@@ -34,7 +35,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.8.1";
+export const SERVER_VERSION = "1.9.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -192,6 +193,7 @@ export function createServer(env: Env): McpServer {
 					w >= lc.week ? rosterWeather(lc, w, ids) : Promise.resolve(new Map<string, GameWeather>()),
 					impliedNorms(lc, w),
 				]);
+				const outlooks = await injuryOutlooks(lc, ids, headlines);
 				// nflverse context per player: weekly consensus rank, injury report, team implied total, recent usage.
 				const extra = (id: string) => {
 					const c = nflCtx.get(id);
@@ -210,6 +212,7 @@ export function createServer(env: Env): McpServer {
 						...(pl?.depth ? { depth: pl.depth } : {}),
 						...(team && implied.has(team) ? { implied: implied.get(team), ...impliedDelta(implied.get(team), norms.get(team)) } : {}),
 						...(c?.play_pct != null ? { play_pct: c.play_pct, ...(c.play_basis ? { play_basis: c.play_basis } : {}), ...(c.play_note ? { play_note: c.play_note } : {}) } : {}),
+						...(outlooks.get(id) ? { injury_outlook: outlooks.get(id) } : {}),
 						...(c?.recent ? { recent: compactRecent(c.recent) } : {}),
 						...(c?.role_change ? { role_change: c.role_change } : {}),
 				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
@@ -341,7 +344,7 @@ export function createServer(env: Env): McpServer {
 				} else {
 					out.projections = "unavailable (Sleeper projections endpoint did not respond as expected)";
 				}
-				out.as_of = await asOf(lc, ["injury_tags", "projections", "injury_report", "lines", "rankings", "stats", "news", ...(weather.size ? (["weather"] as const) : [])], {
+				out.as_of = await asOf(lc, ["injury_tags", "projections", "injury_report", "injury_history", "lines", "rankings", "stats", "news", ...(weather.size ? (["weather"] as const) : [])], {
 					teams: ids.map((id) => lc.players.get(id)?.team),
 					weatherAt: weatherFetchedAt(weather.values()),
 				});
@@ -683,6 +686,7 @@ export function createServer(env: Env): McpServer {
 			Promise.all(players.map((p) => playerNews(p.id, { limit: 2, maxAgeHours: 7 * 24 }))),
 			impliedNorms(lc, w),
 		]);
+		const outlooks = await injuryOutlooks(lc, players.map((p) => p.id), new Map(players.map((p, i) => [p.id, news[i]![0]]).filter((x): x is [string, NewsItem] => !!x[1])));
 		const vals = await Promise.all(
 			players.map((p) =>
 				valuePlayer({
@@ -735,6 +739,7 @@ export function createServer(env: Env): McpServer {
 				...(c?.projection_check ? { projection_check: c.projection_check } : {}),
 				...(c?.injury_report ? { injury_report: c.injury_report } : {}),
 				...(c?.play_pct != null ? { play_pct: c.play_pct, ...(c.play_basis ? { play_basis: c.play_basis } : {}) } : {}),
+				...(outlooks.get(p.id) ? { injury_outlook: outlooks.get(p.id) } : {}),
 				...(news[i]!.length ? { news: news[i]!.map((n) => newsLine(n)) } : {}),
 			};
 		});
@@ -1061,6 +1066,7 @@ const CONTEXT_LEGEND =
 	"recent = per-game over the last 3 weeks with stats: snap %, targets and target share, carries, rz_opps (red-zone targets + carries), " +
 	"pts under league scoring and xfp (expected points for that usage). injury_report = official report: status (injury), practice. " +
 	"role_change = usage trends: usage that moved sharply in the last 3 weeks vs earlier (context; injury-shortened games are left out of the baseline). projection_check = Sleeper's projection far from recent usage: check these before acting. news = latest headline in the last 72h (get_player_news for more). " +
+	"injury_outlook = base rates for his current injury since 2013 (chance to play when listed, time missed, return-game snaps, re-aggravation) and his own past episodes (get_injury_history for all). " +
 	"depth = Sleeper depth chart slot (RB1, QB2; WRs as LWR/RWR/SWR + order). injured_since = when the current injury began.";
 
 /**

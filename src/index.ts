@@ -6,6 +6,7 @@ import { refreshPlayers } from "./players";
 import { LeagueContext } from "./league";
 import { saveSnapshot } from "./changes";
 import { recordReports } from "./asof";
+import { syncInjuryHistory } from "./injuries/sync";
 import { sleeper } from "./sleeper";
 import { SERVER_NAME, SERVER_VERSION, createServer } from "./tools";
 
@@ -58,6 +59,20 @@ export default {
 				await LeagueContext.load(env)
 					.then((lc) => Promise.all([saveSnapshot(lc), recordReports(lc)]))
 					.catch((e) => console.error("snapshot failed", e));
+				// Injury history: up to 4 seasons per run (2013 onward, ~1-2 s each), then the current season every 6 hours.
+				if (env.NFL_DB) {
+					try {
+						const lc = await LeagueContext.load(env);
+						const started = Date.now();
+						for (let i = 0; i < 4 && Date.now() - started < 20_000; i++) {
+							const r = await syncInjuryHistory(env.NFL_DB, Number(lc.season));
+							if (!r) break;
+							console.log(`injury history ${r.season}: ${r.episodes} episodes, ${r.listings} listings`);
+						}
+					} catch (e) {
+						console.error("injury history failed", e);
+					}
+				}
 				if (sync) throw sync;
 			})(),
 		);

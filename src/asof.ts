@@ -10,7 +10,7 @@ import { NflData, sleeperTeam } from "./nflverse/stats";
 import { poolFetchedAt } from "./scoring";
 import { eastern } from "./waivers";
 
-export type Source = "injury_tags" | "projections" | "injury_report" | "lines" | "rankings" | "adp" | "stats" | "usage" | "news" | "weather" | "transactions";
+export type Source = "injury_history" | "injury_tags" | "projections" | "injury_report" | "lines" | "rankings" | "adp" | "stats" | "usage" | "news" | "weather" | "transactions";
 
 /** Hours after which a source counts as stale. */
 const STALE_HOURS: Partial<Record<Source, number>> = {
@@ -126,6 +126,14 @@ export async function asOf(lc: LeagueContext, sources: Source[], opts: AsOfOptio
 		if (want.has("transactions")) out.transactions = "Sleeper, read just now (authoritative)";
 		if (want.has("weather") && opts.weatherAt) out.weather = `Open-Meteo forecast, fetched ${stamp(opts.weatherAt, now, STALE_HOURS.weather)}`;
 
+		if (want.has("injury_history") && lc.env.NFL_DB) {
+			const rows = await lc.env.NFL_DB.prepare("SELECT key, value FROM nfl_meta WHERE key LIKE 'injury_hist:%'").all<{ key: string; value: string }>().catch(() => null);
+			const seasons = (rows?.results ?? []).map((r) => Number(r.key.split(":")[1])).sort((a, b) => a - b);
+			const cur = rows?.results.find((r) => r.key === `injury_hist:${lc.season}`);
+			out.injury_history = seasons.length
+				? `nflverse, seasons ${seasons[0]}-${seasons[seasons.length - 1]} (${seasons.length} loaded)${cur ? `; ${lc.season} rebuilt ${stamp(cur.value, now, 7)}` : ""}`
+				: "not loaded yet (the hourly job backfills 4 seasons per run)";
+		}
 		const nflSources = (["injury_report", "lines", "rankings", "stats", "usage"] as Source[]).filter((s) => want.has(s));
 		if (nflSources.length && lc.env.NFL_DB) {
 			const nfl = NflData.from(lc.env, lc.season);

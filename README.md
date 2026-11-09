@@ -306,6 +306,39 @@ Since 1.6:
   starters means no adjustment. In this league QBs get x1.248 through week 9; RB/WR/TE stay x1.
   `dynasty_value` is the adjusted value, `dynasty_market_value` the raw blend, `format_multiplier`
   the ratio, and `format_adjustment` in `compare_players` / `evaluate_trade` shows the inputs.
+- **Injury history (1.9).** Each injury becomes an episode, rebuilt from public weekly nflverse
+  data: the official report, weekly rosters (injured reserve) and snap counts, 2013 onward (2012
+  has no snap counts). The report alone misses most absences, because a player placed on IR
+  drops off it: Justin Jefferson in 2023 played 71% of snaps in week 5, had no report rows in
+  weeks 6-9, and was listed Questionable in weeks 10-12. So a **missed** episode is a run of his
+  team's games without his snaps, preceded by games he played, with an injury on a report inside
+  the run or the week before, or on injured reserve (R01/R04/R48; with no report row the body part
+  is `undisclosed`, as with Derrick Henry's 2021 foot). A game just before it under 75% of his usual
+  snaps is where he got hurt. **Played-through** episodes are weeks listed with a game status in
+  which he played. Only regulars count (median snap share 40%+); fullbacks are excluded.
+  `get_injury_history` lists a player's episodes. For a currently injured player, the roster,
+  injury report and valuation rows add `injury_outlook`, with base rates for that injury at his
+  position (falling back to all positions under 30 episodes):
+  - chance to play when Questionable, by last practice;
+  - games missed and the chance he's back within 1/2/4 games (Kaplan-Meier, with season-ending
+    episodes censored);
+  - first-game-back snap share against his usual;
+  - re-aggravation within 8 weeks;
+  - his own past episodes, and severity words in the latest headline ("week-to-week", "MCL",
+    "placed on injured reserve").
+  The hourly job loads up to 4 seasons per run and rebuilds the current season every 6 hours.
+- **How the injury numbers were checked.** The episodes were compared against public record
+  (Jefferson, Kupp, Burrow, Rodgers and Chase in 2022-23, McCaffrey 2021, Henry 2021, Barkley
+  2020). A separate Python implementation reproduced the listing outcomes row for row from the
+  raw CSVs, and the rates (Kaplan-Meier, medians, ratios) exactly. The Worker's D1 rows match the
+  offline run for 2021-2023 exactly. `test/injuries.test.ts` pins all of this on real-data
+  fixtures, and deliberate mutations of the thresholds, the return-game rule, the Kaplan-Meier
+  risk set and the fullback rules fail it. Knee listings come out at 52% / 72% / 92% play after
+  DNP / Limited / Full, in line with an independent 2016-2025 study (50 / 75 / 92).
+- **CSV parser fix.** A quoted field spanning lines made `parseCsvColumns` return every column in
+  file order, or (past the last wanted column) emit a blank row. Historical nflverse injury files
+  have such fields; this season's files don't, so live data wasn't affected. The parser now
+  matches Python's `csv` module exactly on 12 full nflverse files.
 - **Checking the multipliers.** `node scripts/verify-format.mjs --through 9 --band 8` recomputes
   them with no shared code, from Sleeper's weekly stats and from nflverse's raw CSV, prints how
   they move with the starter count, and exits 1 on `--expect QB=1.248` mismatches.

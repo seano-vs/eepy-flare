@@ -42,6 +42,15 @@ describe("parseCsvColumns", () => {
 		const full = parseCsv(csv);
 		expect(parseCsvColumns(csv, full.header).rows).toEqual(full.rows);
 	});
+	it("keeps the requested columns and order when a quoted field spans lines (nflverse injury files)", () => {
+		// Real shape from injuries_2023.csv: practice_status is sometimes "\n    ".
+		const multi = 'season,week,full_name,report_status,practice_status\n2023,1,A,Out,"\n    "\n2023,2,B,Questionable,Limited Participation in Practice\n';
+		expect(parseCsvColumns(multi, ["report_status", "full_name", "missing"]).rows).toEqual([
+			["Out", "A", ""],
+			["Questionable", "B", ""],
+		]);
+		expect(parseCsvColumns(multi, ["full_name"], { column: "report_status", accept: (v) => v === "Questionable" }).rows).toEqual([["B"]]);
+	});
 });
 
 describe("extractRows", () => {

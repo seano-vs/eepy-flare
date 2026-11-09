@@ -14,6 +14,7 @@ import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
 import { poolFetchedAt, weekPool } from "./scoring";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { round } from "./scoring";
+import { injuryOutlooks, playerHistory } from "./injuries/outlook";
 
 type Row = Record<string, unknown>;
 
@@ -343,6 +344,76 @@ export function registerNflTools(server: McpServer, env: Env): void {
 		},
 	);
 
+	// ------------------------------------------------------------ injury history
+	server.registerTool(
+		"get_injury_history",
+		{
+			title: "Injury history and outlook",
+			description:
+				"Each player's injury episodes since 2013 (official report, injured reserve and snap counts from nflverse): body part, week, games missed, return week and first-game-back snap share, plus seasons played through a listing. " +
+				"For a currently injured player, base rates for that injury at his position: chance to play when Questionable (by last practice), games missed, chance back within 1/2/4 games, first-game-back snap share and re-aggravation. " +
+				"Injuries placed straight on IR without a report row show as 'undisclosed'.",
+			inputSchema: z.object({
+				players: z.array(z.string()).min(1).max(6).describe("Names or Sleeper ids. 'roster' alone means your injured players."),
+			}),
+			annotations: READ_ONLY,
+		},
+		async ({ players }) => {
+			try {
+				const { lc, nfl } = await load();
+				if (!env.NFL_DB) return fail("The nflverse mirror (D1) isn't configured.");
+				const ids =
+					players.length === 1 && /^(roster|my roster|mine)$/i.test(players[0]!)
+						? (lc.myRoster().players ?? []).filter((id) => lc.players.get(id)?.injury)
+						: players.map((q) => lc.players.resolve(q).id);
+				if (!ids.length) return ok({ players: [], note: "No injured players on your roster." });
+				const [map, news] = await Promise.all([nfl.ids(ids), latestHeadlines(ids, 72)]);
+				const gs = ids.map((id) => map.get(id)?.gsis_id).filter((g): g is string => !!g);
+				const [hist, outlooks] = await Promise.all([playerHistory(env.NFL_DB, gs), injuryOutlooks(lc, ids, news)]);
+				const loaded = await env.NFL_DB.prepare("SELECT COUNT(*) AS n, MIN(season) AS lo, MAX(season) AS hi FROM nfl_injury_episodes").first<{ n: number; lo: number; hi: number }>().catch(() => null);
+				return ok({
+					as_of: await asOf(lc, ["injury_tags", "injury_report", "injury_history", "news"], { teams: ids.map((id) => lc.players.get(id)?.team) }),
+					history_loaded: loaded?.n ? `${loaded.n} episodes, ${loaded.lo}-${loaded.hi}` : "not loaded yet (the hourly job backfills one season per run)",
+					players: ids.map((id) => {
+						const g = map.get(id)?.gsis_id;
+						const h = (g ? hist.get(g) : undefined) ?? [];
+						const missed = h.filter((x) => x.kind === "missed");
+						const byBody: Record<string, number> = {};
+						for (const x of h) byBody[x.body] = (byBody[x.body] ?? 0) + 1;
+						return {
+							player: fmt(lc.ref(id)),
+							...(outlooks.get(id) ? { current: outlooks.get(id) } : {}),
+							summary: { episodes: h.length, missed_time: missed.length, games_missed: missed.reduce((a, x) => a + x.games_missed, 0), by_body: byBody },
+							episodes: h.map((x) => ({
+								season: x.season,
+								team: x.team,
+								kind: x.kind,
+								body: x.body,
+								week: x.start_week,
+								...(x.start_date ? { listed: x.start_date.slice(0, 10) } : {}),
+								...(x.in_game ? { hurt_in_game: true } : {}),
+								games_missed: x.games_missed,
+								return_week: x.return_week,
+								...(x.ongoing ? { still_out: true } : x.censored ? { out_for_season: true } : {}),
+								...(x.pre_snap_pct != null ? { usual_snaps: x.pre_snap_pct } : {}),
+								...(x.return_snap_pct != null && x.kind === "missed" ? { return_snaps: x.return_snap_pct, ...(x.return2_snap_pct != null ? { second_game_snaps: x.return2_snap_pct } : {}) } : {}),
+								...(x.first_status ? { first_status: x.first_status } : {}),
+								...(x.first_practice ? { first_practice: x.first_practice } : {}),
+								...(x.recurred ? { recurred: true } : {}),
+							})),
+							...(g ? {} : { note: "No nflverse id mapping for this player." }),
+						};
+					}),
+					note:
+						"Episodes come from public weekly data, not medical records: 'missed' = team games without his snaps after an injury on the report or injured reserve; 'played_through' = listed with a game status and played. " +
+						"Rates are for regulars (median snap share 40%+). Severity words come from the latest headline. Season-ending episodes count as censored in 'back within'.",
+				});
+			} catch (e) {
+				return fail(e);
+			}
+		},
+	);
+
 	// ------------------------------------------------------------ injuries
 	server.registerTool(
 		"get_injury_report",
@@ -410,12 +481,16 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					? [...new Set([...mine].map((id) => lc.players.get(id)?.team).filter((t): t is string => !!t && playing.has(t) && !published!.has(t)))].sort()
 					: [];
 				const missingSet = new Set(missing);
+				const outlooks = await injuryOutlooks(lc, [...mine]);
 				const prac = missing.length ? await practiceFromNews([...mine].filter((id) => missingSet.has(lc.players.get(id)?.team ?? "")), 72) : new Map();
 				return ok({
 					as_of: await asOf(lc, ["injury_report", "injury_tags", ...(prac.size ? (["news"] as const) : [])], { teams: [...mine].map((id) => lc.players.get(id)?.team) }),
 					week: w,
 					team: lc.team(roster.roster_id).owner,
-					report: onReport.map(fmtRow),
+					report: onReport.map((r) => {
+						const sid = maps.byGsis.get(String(r.gsis_id));
+						return { ...fmtRow(r), ...(sid && outlooks.get(sid) ? { injury_outlook: outlooks.get(sid) } : {}) };
+					}),
 					...(sleeperOnly.length ? { flagged_by_sleeper_only: sleeperOnly } : {}),
 					...(missing.length
 						? {
