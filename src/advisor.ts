@@ -400,7 +400,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					const c = ctx.get(sid);
 					return {
 						player: fmt(p),
-						league_status: owned.has(sid) ? lc.team(owned.get(sid)!).owner : "available",
+						league_status: owned.has(sid) ? lc.team(owned.get(sid)!).owner : waivers.get(sid)?.status === "on waivers" ? `on waivers until ${waivers.get(sid)!.clears_after} (claim)` : "free agent",
 						...(waivers.get(sid) ? { waiver: waivers.get(sid) } : {}),
 						...(rankedBy.get(sid)?.proj_week != null ? { proj_week: rankedBy.get(sid)!.proj_week } : {}),
 						...(x != null ? { xfp_recent: round(x, 1) } : {}),
