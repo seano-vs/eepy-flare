@@ -412,7 +412,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						...(c?.recent ? { recent: { snap_pct: c.recent.snap_pct, targets: c.recent.targets, carries: c.recent.carries, rz_opps: c.recent.rz_opps } } : {}),
 						...(c?.ecr?.ros ? { ros_rank: c.ecr.ros } : {}),
 						...(waivers.get(sid)?.status === "free agent" && !owned.has(sid)
-							? { bid: null, add_now: "Free agent: add him now for $0 (no claim needed) before someone else does." }
+							? { bid: null, add_now: "Free agent: his game hasn't kicked off and he wasn't just dropped, so add him now for $0 before someone else does." }
 							: s
 								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
 								: { bid: null, basis: x == null ? "no recent usage data" : `no ${p.pos} claims in this league yet` }),
@@ -469,8 +469,8 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 					advice,
 					note:
 						"Bids come from this league's winning bids for players at the same position with similar expected points per game (league scoring) in the 3 weeks before the claim. " +
-						"aggressive also clears the best losing bid seen on those comparables. waiver.status: 'on waivers' = dropped within the clear window (bid); 'free agent' = add now for $0. " +
-						"Sleeper also locks players on waivers once their game kicks off until the next run, which this can't see.",
+						"aggressive also clears the best losing bid seen on those comparables. waiver.status: 'on waivers' = a FAAB claim (waiver.reason: dropped within the clear window, and/or his team has kicked off this week: " +
+						"Sleeper holds every player from his game's kickoff until the next main run, so after kickoff he can't be added for $0); waiver.clears_after = when he becomes a free agent. 'free agent' = add now for $0.",
 				});
 			} catch (e) {
 				return fail(e);

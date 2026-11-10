@@ -1,6 +1,6 @@
 {
   "name": "eepy-flare",
-  "version": "1.9.2",
+  "version": "1.10.0",
   "description": "Sleeper fantasy football MCP server on Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",

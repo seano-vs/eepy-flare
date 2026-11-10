@@ -14,6 +14,7 @@ import { adpFetchedAt, dynastyAdp, isDynasty } from "./dynasty";
 import { poolFetchedAt, weekPool } from "./scoring";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { round } from "./scoring";
+import { waiverStatuses, type WaiverStatus } from "./waivers";
 import { injuryOutlooks, playerHistory } from "./injuries/outlook";
 
 type Row = Record<string, unknown>;
@@ -307,10 +308,12 @@ export function registerNflTools(server: McpServer, env: Env): void {
 					);
 				const n = limit ?? 15;
 				let out: Row[];
+				let rankedIds: string[] = [];
 				if (key === "waiver") {
 					// This week's projection + recent expected points, re-ranked by headlines; includes
 					// players with little usage yet (a newly named starter) that a usage sort would miss.
 					const ranked = await rankWaiverTargets(lc, { position, includeInjured: include_injured, limit: n });
+					rankedIds = ranked.targets.map((t) => t.id);
 					const byId = new Map(rows.map((r) => [r.sid, r]));
 					out = ranked.targets.map((t) => ({
 						...(byId.get(t.id) ? compact(byId.get(t.id)!) : { player: fmt(lc.ref(t.id)), league_status: "available", note: "under 2 games of usage in the window" }),
@@ -329,6 +332,15 @@ export function registerNflTools(server: McpServer, env: Env): void {
 						return { ...compact(r), ...(sig ? { role_news: sig.kind === "negative" ? `Warning: ${sig.reason}` : sig.reason } : {}), ...(h ? { news: newsLine(h) } : {}) };
 					});
 				}
+				// "available" isn't actionable: say whether each one is a free agent now or a claim.
+				const sids = key === "waiver" ? rankedIds : rows.slice(0, n).map((r) => r.sid);
+				const holds = await waiverStatuses(lc, sids.filter((x): x is string => !!x && !owned.has(x))).catch(() => new Map<string, WaiverStatus>());
+				out = out.map((o, i) => {
+					const sid = sids[i];
+					if (!sid || o.league_status !== "available") return o;
+					const h = holds.get(sid);
+					return { ...o, league_status: h?.status === "on waivers" ? `on waivers until ${h.clears_after} (claim)` : "free agent" };
+				});
 				return ok({
 					as_of: await asOf(lc, ["stats", "projections", "news"]),
 					weeks: `${from}-${latest}`,

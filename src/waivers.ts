@@ -2,6 +2,7 @@
 // guessed from settings), and which available players are still on waivers after a drop.
 
 import type { LeagueContext } from "./league";
+import { NflData, sleeperTeam } from "./nflverse/stats";
 import { sleeper, type Transaction } from "./sleeper";
 
 export interface WaiverSchedule {
@@ -16,6 +17,15 @@ export interface WaiverSchedule {
 	/** Raw Sleeper settings, read defensively (their meaning isn't documented). */
 	settings: { waiver_day_of_week: unknown; daily_waivers_hour: unknown };
 	based_on_runs: number;
+	/** The main run in Pacific wall time (Sleeper's hour is Pacific), for computing release times. */
+	main_pt: MainRun;
+}
+
+/** The weekly main waiver run, in Pacific wall time. */
+export interface MainRun {
+	weekday: string;
+	hour: number;
+	minute: number;
 }
 
 async function allTransactions(lc: LeagueContext, weeks?: number[]): Promise<Transaction[]> {
@@ -98,21 +108,86 @@ export async function waiverSchedule(lc: LeagueContext): Promise<WaiverSchedule>
 				: "Unknown clear window.",
 		settings: { waiver_day_of_week: s.waiver_day_of_week ?? null, daily_waivers_hour: s.daily_waivers_hour ?? null },
 		based_on_runs: runs.length,
+		// Fallback Wednesday 7:05 AM PT: this league's runs through week 9 were all Wed 10:05-10:06 AM ET.
+		main_pt: { weekday: inf.main?.weekday ?? "Wednesday", hour: hourPt ?? 7, minute: inf.main?.minute ?? 5 },
 	};
+}
+
+// ---------------------------------------------------------------- game-start hold
+
+/** The instant of a wall-clock time in a time zone (handles daylight saving). Pure; exported for tests. */
+export function zonedEpoch(y: number, mo: number, d: number, h: number, mi: number, timeZone: string): number {
+	const guess = Date.UTC(y, mo - 1, d, h, mi);
+	// Offset of the zone at (about) that instant, then correct once more for a DST boundary.
+	const off = (t: number) => {
+		const p = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", hourCycle: "h23" }).formatToParts(new Date(t));
+		const g = (k: string) => Number(p.find((x) => x.type === k)?.value);
+		return Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute")) - Math.floor(t / 60000) * 60000;
+	};
+	const first = guess - off(guess);
+	return guess - off(first);
+}
+
+/** The first main run strictly after `after`. Pure; exported for tests. */
+export function nextMainRun(after: number, main: MainRun): number {
+	for (let d = 0; d <= 8; d++) {
+		const day = new Date(after + d * 86_400_000);
+		const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "numeric", day: "numeric", weekday: "long" }).formatToParts(day);
+		const g = (k: string) => parts.find((x) => x.type === k)?.value ?? "";
+		if (g("weekday") !== main.weekday) continue;
+		const run = zonedEpoch(Number(g("year")), Number(g("month")), Number(g("day")), main.hour, main.minute, "America/Los_Angeles");
+		if (run > after) return run;
+	}
+	return after + 7 * 86_400_000;
+}
+
+/**
+ * Sleeper holds every player on waivers from his team's kickoff until the next main run, so after
+ * kickoff he can only be claimed (FAAB, processed in that run), not added for $0. This league's
+ * transactions bear it out: of 68 completed free-agent adds through week 10, none came between a
+ * player's kickoff and the next Wednesday run, and every Wednesday add came after the 10:05 AM ET
+ * run. A bye or a game not yet started leaves him free. Pure; exported for tests.
+ */
+export function gameHold(kickoffs: number[], now: number, main: MainRun): { kickoff: number; until: number } | null {
+	const started = kickoffs.filter((k) => k <= now).sort((a, b) => b - a)[0];
+	if (started == null) return null;
+	const until = nextMainRun(started, main);
+	return now < until ? { kickoff: started, until } : null;
+}
+
+/** Kickoff instants by Sleeper team for the regular-season weeks given (from the nflverse schedule). */
+export async function teamKickoffs(lc: LeagueContext, weeks: number[]): Promise<Map<string, number[]>> {
+	const out = new Map<string, number[]>();
+	const nfl = NflData.from(lc.env, lc.season);
+	for (const w of weeks) {
+		for (const g of await nfl.games(w).catch(() => [])) {
+			if (g.game_type && g.game_type !== "REG") continue;
+			const [y, mo, d] = String(g.gameday ?? "").split("-").map(Number);
+			const [h, mi] = String(g.gametime ?? "").split(":").map(Number);
+			if (!y || !mo || !d || h == null || Number.isNaN(h)) continue;
+			const k = zonedEpoch(y, mo, d, h, mi ?? 0, "America/New_York");
+			for (const t of [sleeperTeam(g.home_team), sleeperTeam(g.away_team)]) if (t) out.set(t, [...(out.get(t) ?? []), k]);
+		}
+	}
+	return out;
 }
 
 export interface WaiverStatus {
 	status: "on waivers" | "free agent";
+	/** Why he's on waivers: dropped within the clear window, and/or his game has kicked off. */
+	reason?: ("dropped" | "game started")[];
 	dropped_by?: string;
 	dropped_at?: string;
-	/** Earliest time he can clear, in Eastern: drop + clear days. */
+	/** When he becomes a free agent, in Eastern (the later of the two holds). */
 	clears_after?: string;
+	/** What to do: a FAAB claim, or add now. */
+	how?: string;
 }
 
 /**
- * For unrostered players: on waivers if dropped within the league's clear window, else a free
- * agent. Sleeper also puts players whose game has kicked off on waivers until the next run,
- * which this can't see; the tools say so.
+ * For unrostered players: on waivers if dropped within the league's clear window, or if his team
+ * has kicked off this week and the next main run hasn't happened (gameHold); else a free agent.
+ * With both, he clears at the later time. Teamless players and teams on bye have no game hold.
  */
 export async function waiverStatuses(lc: LeagueContext, playerIds: string[]): Promise<Map<string, WaiverStatus>> {
 	const out = new Map<string, WaiverStatus>();
@@ -121,21 +196,32 @@ export async function waiverStatuses(lc: LeagueContext, playerIds: string[]): Pr
 	const txs = (await allTransactions(lc, weeks)).filter((t) => t.status === "complete" && t.drops);
 	const owned = lc.ownership();
 	const now = Date.now();
+	// Last week's games too: Sunday's kickoffs hold players until Wednesday, after Sleeper's week has rolled over.
+	const [schedule, kicks] = await Promise.all([
+		waiverSchedule(lc).catch(() => null),
+		teamKickoffs(lc, [lc.week - 1, lc.week].filter((w) => w >= 1)).catch(() => new Map<string, number[]>()),
+	]);
+	const main = schedule?.main_pt ?? { weekday: "Wednesday", hour: Number(lc.league.settings.daily_waivers_hour ?? 7), minute: 5 };
 	for (const id of playerIds) {
 		if (owned.has(id)) continue;
 		const drops = txs.filter((t) => t.drops && id in t.drops).sort((a, b) => (b.status_updated ?? b.created) - (a.status_updated ?? a.created));
 		const last = drops[0];
 		const at = last ? (last.status_updated ?? last.created) : null;
-		if (last && at && now < at + clearDays * 86_400_000) {
-			out.set(id, {
-				status: "on waivers",
-				dropped_by: lc.team(last.drops![id]!).owner,
-				dropped_at: eastern(at),
-				clears_after: eastern(at + clearDays * 86_400_000),
-			});
-		} else {
-			out.set(id, { status: "free agent" });
+		const dropHold = last && at && now < at + clearDays * 86_400_000 ? at + clearDays * 86_400_000 : null;
+		const team = lc.players.get(id)?.team;
+		const game = team ? gameHold(kicks.get(team) ?? [], now, main) : null;
+		if (dropHold == null && !game) {
+			out.set(id, { status: "free agent", how: "Free agent: add now for $0." });
+			continue;
 		}
+		const until = Math.max(dropHold ?? 0, game?.until ?? 0);
+		out.set(id, {
+			status: "on waivers",
+			reason: [...(dropHold != null ? (["dropped"] as const) : []), ...(game ? (["game started"] as const) : [])],
+			...(dropHold != null ? { dropped_by: lc.team(last!.drops![id]!).owner, dropped_at: eastern(at!) } : {}),
+			clears_after: eastern(until),
+			how: `FAAB claim (with a drop if your roster is full), processed in the run at ${eastern(game?.until ?? until)}; he can't be added for $0 before ${eastern(until)}.`,
+		});
 	}
 	return out;
 }

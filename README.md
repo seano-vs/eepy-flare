@@ -349,6 +349,17 @@ Since 1.6:
   file order, or (past the last wanted column) emit a blank row. Historical nflverse injury files
   have such fields; this season's files don't, so live data wasn't affected. The parser now
   matches Python's `csv` module exactly on 12 full nflverse files.
+- **Game-start waiver hold (1.10).** Sleeper holds every player on waivers from his team's
+  kickoff until the next main run (Wednesday ~10:06 AM ET here). In that window he can only be
+  claimed with FAAB, not added for $0. This league's transactions through week 10 confirm it: none
+  of 70 completed free-agent adds came between a player's kickoff and the next Wednesday run, and
+  every Wednesday add came after the run. `waiverStatuses` combines this hold with the drop clear
+  window and reports the later release time. Players whose team hasn't kicked off this week, is on
+  bye, or who have no team stay free agents. `get_faab_advice`, trending adds, `search_players`
+  (`league_status`), `get_team_needs` (`best_available_adds`, renamed from `best_free_agent_adds`)
+  and `get_opportunity_leaders` all show either "free agent: add now" or "on waivers until …
+  (claim)". Lock-timeline pivots only list players who are free agents right now.
+  `test/waivers.test.ts` replays the league's real adds against the rule.
 - **Checking the multipliers.** `node scripts/verify-format.mjs --through 9 --band 8` recomputes
   them with no shared code, from Sleeper's weekly stats and from nflverse's raw CSV, prints how
   they move with the starter count, and exits 1 on `--expect QB=1.248` mismatches.

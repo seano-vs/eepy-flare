@@ -23,7 +23,7 @@ import { registerLeagueTools } from "./league-tools";
 import { readPrefs } from "./prefs";
 import { gameWeather, weatherFetchedAt, type GameWeather } from "./weather";
 import { lockTimeline, type LockCandidate, type LockStarter } from "./locks";
-import { clock, eastern } from "./waivers";
+import { clock, eastern, type WaiverStatus } from "./waivers";
 import { parseSince } from "./changes";
 import { NflData, sleeperTeam } from "./nflverse/stats";
 import { injuryOutlooks } from "./injuries/outlook";
@@ -35,7 +35,7 @@ import { sleeper, type Roster, type Transaction } from "./sleeper";
 export { fmt };
 
 export const SERVER_NAME = "sleeper-fantasy";
-export const SERVER_VERSION = "1.9.2";
+export const SERVER_VERSION = "1.10.0";
 
 /**
  * Server instructions sent to every MCP client. The second half matters as much
@@ -297,11 +297,14 @@ export function createServer(env: Env): McpServer {
 									return { slot, label: fmt(lc.ref(id)), pos: pl?.pos ?? "?", kickoff: k, proj: proj(id), ...(risk ? { risk } : {}) };
 								});
 							const benchIds = (r.players ?? []).filter((id) => !starterSet.has(id) && !reserve.has(id));
-							const fas = poolArr
+							const top = poolArr
 								.filter((e) => e.pts > 0 && !owned.has(e.id) && !isUnavailable(lc.players.get(e.id)))
 								.sort((a, b) => b.pts - a.pts)
 								.slice(0, 60)
 								.map((e) => e.id);
+							// Only true free agents can be picked up on game day (claims process at the next main run).
+							const st = await waiverStatuses(lc, top).catch(() => new Map<string, WaiverStatus>());
+							const fas = top.filter((id) => st.get(id)?.status === "free agent");
 							const cands: LockCandidate[] = [
 								...benchIds.map((id) => ({ id, source: "bench" as const })),
 								...fas.map((id) => ({ id, source: "free agent" as const })),
@@ -317,7 +320,7 @@ export function createServer(env: Env): McpServer {
 									...(x.pivots ? { pivots: x.pivots.map((p) => ({ ...p, options: p.options.map((o) => o.replace(/kicks off (\d{4}-\d\d-\d\d \d\d:\d\d)/, (_m, k: string) => `kicks off ${pretty(k)}`)) })) } : {}),
 								})),
 								...(tl.no_game.length ? { no_game: tl.no_game } : {}),
-								note: "Each starter locks at his kickoff; inactives come out about 90 minutes before. Free-agent pivots must be free agents, not on waivers (players also lock onto waivers once their game starts).",
+								note: "Each starter locks at his kickoff; inactives come out about 90 minutes before. Free-agent pivots are free agents right now (not dropped within the clear window, team not kicked off); each one goes onto waivers at his own kickoff.",
 							};
 						}
 					} catch (e) {
@@ -606,7 +609,7 @@ export function createServer(env: Env): McpServer {
 		{
 			title: "Search players",
 			description:
-				"Search NFL players by name, team and/or position. Shows who rosters each player in this league (or 'available') and this week's league-scored projection.",
+				"Search NFL players by name, team and/or position. Shows who rosters each player in this league, or for unrostered players whether he's a free agent (add now) or on waivers until a given time (a claim: dropped recently, or his team has kicked off before the Wednesday run), and this week's league-scored projection.",
 			inputSchema: z.object({
 				name: z.string().optional().describe("Full or partial name, e.g. 'bijan' or 'St. Brown'."),
 				team: z.string().optional().describe("NFL team abbreviation, e.g. 'DET'. Use 'FA' for free agents."),
@@ -642,6 +645,7 @@ export function createServer(env: Env): McpServer {
 				hits = hits.slice(0, n);
 				// Without a name, rank by this week's projection when we have one.
 				if (!name && pool.size) hits.sort((a, b) => (pool.get(b.id)?.pts ?? -1) - (pool.get(a.id)?.pts ?? -1));
+				const statuses = await waiverStatuses(lc, hits.filter((p) => !owned.has(p.id)).map((p) => p.id)).catch(() => new Map<string, WaiverStatus>());
 				const rows = hits.map((p) => ({
 						id: p.id,
 						name: p.name,
@@ -654,7 +658,7 @@ export function createServer(env: Env): McpServer {
 						...(p.depth ? { depth: p.depth } : {}),
 						...(p.injury_start ? { injured_since: p.injury_start } : {}),
 						...(p.status ? { status: p.status } : {}),
-						league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : "available",
+						league_status: owned.has(p.id) ? lc.team(owned.get(p.id)!).owner : statuses.get(p.id)?.status === "on waivers" ? `on waivers until ${statuses.get(p.id)!.clears_after} (claim)` : "free agent",
 						...(pool.size ? { proj_week: pool.get(p.id)?.pts ?? 0 } : {}),
 					}));
 				return ok(hidden && !rows.length ? { players: rows, teamless_hidden: hidden, note: "Players with no NFL team (unsigned or retired) are hidden; pass include_teamless: true to see them." } : rows);
@@ -868,7 +872,7 @@ export function createServer(env: Env): McpServer {
 				const partnerIds = new Set(getPlayers.map((p) => owned.get(p.id)).filter((x): x is number => x != null));
 				if (partnerIds.size > 1) warnings.push("Players received come from more than one roster.");
 				const partner = partnerIds.size === 1 ? lc.rosters.find((x) => x.roster_id === [...partnerIds][0]) : undefined;
-				for (const p of getPlayers) if (!owned.has(p.id)) warnings.push(`${p.name} is not on any roster (free agent).`);
+				for (const p of getPlayers) if (!owned.has(p.id)) warnings.push(`${p.name} is not on any roster.`);
 
 				// Effect on each side's best lineup this week.
 				const pool = poolMap(await weekPool(env.PLAYERS, lc.league, lc.season, v.week, lc.seasonType));

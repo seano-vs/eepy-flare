@@ -11,7 +11,7 @@ import { READ_ONLY, fail, fmt, ok } from "./result";
 import { optimalLineup, round } from "./scoring";
 import { sleeper, type Transaction } from "./sleeper";
 import { diffSnapshots, findSnapshot, parseSince, takeSnapshot } from "./changes";
-import { eastern } from "./waivers";
+import { eastern, waiverStatuses, type WaiverStatus } from "./waivers";
 
 export function registerLeagueTools(server: McpServer, env: Env): void {
 	// ------------------------------------------------------------ playoff odds
@@ -96,6 +96,9 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 							.map(([id]) => id)
 					: [];
 
+				// Free agent now, or a claim (dropped recently, or his team has kicked off before the main run).
+				const holds = await waiverStatuses(lc, freeAgents).catch(() => new Map<string, WaiverStatus>());
+
 				const target = team ? lc.findRoster(team) : undefined;
 				const out = lc.rosters
 					.filter((r) => !target || r.roster_id === target.roster_id)
@@ -115,7 +118,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 									.filter((a) => a.gain >= 1)
 									.sort((a, b) => b.gain - a.gain)
 									.slice(0, 2)
-									.map((a) => ({ player: fmt(lc.ref(a.id)), lineup_gain: a.gain }))
+									.map((a) => ({ id: a.id, player: fmt(lc.ref(a.id)), lineup_gain: a.gain }))
 							: [];
 						const weak = (lineup?.starters ?? [])
 							.map((s, i) => ({ s, i }))
@@ -150,7 +153,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 							...(st ? { record: `${st.wins}-${st.losses}${st.ties ? `-${st.ties}` : ""}` } : {}),
 							faab_left: budget - (r.settings.waiver_budget_used ?? 0),
 							...(gaps.length ? { top_gaps: gaps } : {}),
-							...(adds.length ? { best_free_agent_adds: adds } : {}),
+							...(adds.length ? { best_available_adds: adds.map((a) => ({ ...a, how: holds.get(a.id)?.status === "on waivers" ? `claim: on waivers until ${holds.get(a.id)!.clears_after}` : "free agent: add now" })).map(({ id: _id, ...rest }) => rest) } : {}),
 							...(weak.length ? { weak_slots: weak } : {}),
 							...(holes.length ? { lineup_holes: holes } : {}),
 							qb_coverage: { slots: qbSlots, by_week: qbs, ...(qbs.some((q) => q.qbs_playing < qbSlots) ? { short: true } : {}) },
@@ -162,7 +165,7 @@ export function registerLeagueTools(server: McpServer, env: Env): void {
 					weeks: season.weeks.slice(0, 2).join(", "),
 					teams: out,
 					note:
-						"top_gaps: the two starting slots furthest below the league median this week. best_free_agent_adds: unowned, available players who'd add the most to that team's best lineup this week (on-waivers status not checked). " +
+						"top_gaps: the two starting slots furthest below the league median this week. best_available_adds: unowned players who'd add the most to that team's best lineup this week, each marked 'free agent: add now' or 'claim: on waivers until …' (dropped within the clear window, or his team has kicked off and the next main run hasn't happened). " +
 						"weak_slots: this week's best projected starter is below 80% of the league median at that slot. Projections are Sleeper's; check news for the players involved.",
 				});
 			} catch (e) {
