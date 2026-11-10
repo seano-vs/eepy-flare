@@ -361,15 +361,16 @@ Since 1.6:
   (claim)". Lock-timeline pivots only list players who are free agents right now.
   `test/waivers.test.ts` replays the league's real adds against the rule.
 - **New starters in FAAB pricing (1.11).** When a target's latest headline reports that he starts
-  ("set to start", "named the starter", "set to take over as QB1"; not "could start"), but Sleeper
-  projects him under 80% of his team's previous starter at the position, or not at all, he's
-  priced at that previous starter's projection from the most recent projected week. That price
-  feeds `value_to_you` and the market bid, and shows as `priced_as_starter` with the headline.
-  Example: Carson Beck, Nov 10, priced at Gardner Minshew's 12.4. With no usage history yet, the
-  market bid is matched to past claims at that price or at this week's projection, instead of
-  returning no bid. FAAB value now starts from the next week to be played. Sleeper's
-  `display_week` stays on the finished week until Wednesday, so on Mondays and Tuesdays eepy was
-  pricing waiver targets against a week already played.
+  ("set to start", "named the starter", "set to take over as QB1"; not "could start"), eepy checks
+  each week being valued. Where Sleeper still projects a teammate at his position as the starter
+  (under 80% for him), the two swap projections for that week, so he gets the role's value and the
+  incumbent loses phantom starts. That matters when the incumbent is on your roster: Carson Beck on
+  Nov 10 was projected 1.9 for weeks 11-13 while the injured Gardner Minshew still had 13-19. The
+  swaps show as `priced_as_starter.by_week` with the headline. The market bid for a player with no
+  usage is matched to past claims at Sleeper's projection, since other managers bid on what Sleeper
+  shows them, else at the swap price. FAAB value starts from the next week to be played: Sleeper's
+  `display_week` stays on the finished week until Wednesday. Lineup value doesn't model injury
+  risk to your own starters (e.g. a backup as insurance for a Questionable QB).
 - **Checking the multipliers.** `node scripts/verify-format.mjs --through 9 --band 8` recomputes
   them with no shared code, from Sleeper's weekly stats and from nflverse's raw CSV, prints how
   they move with the starter count, and exits 1 on `--expect QB=1.248` mismatches.

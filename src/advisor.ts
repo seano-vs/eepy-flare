@@ -10,6 +10,7 @@ import { isUnavailable, playerContext } from "./nflverse/context";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { rankWaiverTargets } from "./waiver-targets";
 import { readPrefs } from "./prefs";
+import { applyConfirmedStarter } from "./starters";
 import { confirmedStart, latestHeadlines, newsLine, playerNews, roleSignal } from "./news";
 import { NflData, expectedPoints } from "./nflverse/stats";
 import { READ_ONLY, fail, fmt, ok } from "./result";
@@ -357,7 +358,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const playoffStart = Number(lc.league.settings.playoff_week_start) || 15;
 				// From the next week to be played (Sleeper's display week lags until Wednesday).
 				const fromWeek = lc.upcomingWeek;
-				const [{ byWeek, current }, season] = await Promise.all([
+				const [{ byWeek, current, weeks: weekNums }, season] = await Promise.all([
 					nearTermPpg(lc, fromWeek, Math.min(4, Math.max(1, lastWeek - fromWeek + 1))),
 					loadSeason(lc).catch(() => null),
 				]);
@@ -402,39 +403,44 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const recentWeeks = [fromWeek, fromWeek - 1, fromWeek - 2].filter((w) => w >= 1);
 				const recentPools = await Promise.all(recentWeeks.map((w) => weekPool(lc.env.PLAYERS, lc.league, lc.season, w, lc.seasonType).catch(() => [])));
 				const headlineOf = (sid: string) => rankedBy.get(sid)?.news ?? (player ? singleNews[0] : undefined);
-				const starterPrice = (sid: string): { pts: number; basis: string } | null => {
+				/** The team's previous starter at his position in the most recent projected week (fallback price). */
+				const recentIncumbent = (sid: string): { id: string; pts: number; week: number } | null => {
 					const p = lc.players.get(sid);
-					const n = headlineOf(sid);
-					if (!p?.team || !n || !confirmedStart(n.title)) return null;
-					let incumbent: { id: string; pts: number } | undefined;
-					let prevWeek = 0;
+					if (!p?.team) return null;
 					for (const [i, pool] of recentPools.entries()) {
 						const top = pool.filter((e) => e.id !== sid && e.pos === p.pos && e.pts > 0 && lc.players.get(e.id)?.team === p.team).sort((a, b) => b.pts - a.pts)[0];
-						if (top) {
-							incumbent = top;
-							prevWeek = recentWeeks[i]!;
-							break;
-						}
+						if (top) return { id: top.id, pts: top.pts, week: recentWeeks[i]! };
 					}
-					if (!incumbent) return null;
-					const proj = byWeek[0]?.get(sid)?.pts ?? null;
-					if (proj != null && proj >= 0.8 * incumbent.pts) return null;
-					return {
-						pts: round(incumbent.pts, 1),
-						basis: `Headline "${n.title}" (${n.source}, ${n.age_hours}h ago) says he starts, but Sleeper projects ${proj == null ? "nothing" : proj} for him. Priced at ${fmt(lc.ref(incumbent.id))}'s week ${prevWeek} projection (${round(incumbent.pts, 1)}), his team's previous ${p.pos}1. An assumption: check the starter news before bidding.`,
-					};
+					return null;
 				};
+				const teamOf = (id: string) => lc.players.get(id)?.team ?? undefined;
 				const advice = targets.map((sid) => {
 					const p = lc.players.get(sid)!;
-					const priced = starterPrice(sid);
+					// A confirmed new starter takes the role's projection in every week Sleeper still gives it to
+					// someone else (and that player loses it): lineup value and the market bid use those weeks.
+					const headline = headlineOf(sid);
+					const confirmed = !!headline && confirmedStart(headline.title);
+					const inc = confirmed ? recentIncumbent(sid) : null;
+					const swap = confirmed ? applyConfirmedStarter(byWeek, weekNums, sid, p.pos, teamOf, inc?.pts) : null;
+					const weeks = swap?.weeks ?? byWeek;
+					const priced =
+						swap && swap.swaps.length
+							? {
+									pts: round(swap.swaps[0]!.pts, 1),
+									by_week: Object.fromEntries(swap.swaps.map((x) => [x.week, round(x.pts, 1)])),
+									basis:
+										`Headline "${headline!.title}" (${headline!.source}, ${headline!.age_hours}h ago) says he starts. Sleeper still projects ` +
+										swap.swaps.map((x) => `week ${x.week}: ${x.incumbent ? fmt(lc.ref(x.incumbent)) : "no one"} ${round(x.pts, 1)}, him ${round(x.was, 1)}`).join("; ") +
+										`. Those weeks are valued with the roles swapped. An assumption: check the starter news before bidding.`,
+								}
+							: null;
 					const xUsage = xfpWindow(sid, from, latest);
-					// Without usage (a new starter), comparable claims are matched on his starter-level price, else on
-					// this week's projection, instead of returning no bid.
+					// Without usage (a new starter), comparable claims are matched on the projection other managers
+					// see (Sleeper's, this week), else the starter-level price: the market bids on what it's shown,
+					// not on our role swap (Beck: 12.1 vs a 13.3 swap price that landed among $0 claims).
 					const projNow = byWeek[0]?.get(sid)?.pts ?? null;
-					const x = xUsage ?? priced?.pts ?? (projNow != null && projNow > 0 ? projNow : null);
+					const x = xUsage ?? (projNow != null && projNow > 0 ? projNow : (priced?.pts ?? null));
 					const s = x != null ? suggestBid(p.pos, x, history, myLeft) : null;
-					// Weekly projections with his priced role, for lineup value.
-					const weeks = priced ? byWeek.map((m) => new Map(m).set(sid, { pos: p.pos, pts: priced.pts })) : byWeek;
 					const c = ctx.get(sid);
 					return {
 						player: fmt(p),
@@ -442,7 +448,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						...(waivers.get(sid) ? { waiver: waivers.get(sid) } : {}),
 						...(rankedBy.get(sid)?.proj_week != null ? { proj_week: rankedBy.get(sid)!.proj_week } : {}),
 						...(xUsage != null ? { xfp_recent: round(xUsage, 1) } : {}),
-						...(priced ? { priced_as_starter: { projection: priced.pts, basis: priced.basis } } : {}),
+						...(priced ? { priced_as_starter: { by_week: priced.by_week, basis: priced.basis } } : {}),
 						...(() => {
 							const n = rankedBy.get(sid)?.news ?? singleNews[0];
 							const sig = rankedBy.get(sid)?.role_news ?? (n ? roleSignal(n.title) : null);
@@ -453,7 +459,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						...(waivers.get(sid)?.status === "free agent" && !owned.has(sid)
 							? { bid: null, add_now: "Free agent: his game hasn't kicked off and he wasn't just dropped, so add him now for $0 before someone else does." }
 							: s
-								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: xUsage == null ? `No usage yet: matched to past ${p.pos} claims at his ${priced ? `starter-level price (${priced.pts})` : `week ${fromWeek} projection (${projNow})`}. ${s.basis}` : s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
+								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: xUsage == null ? `No usage yet: matched to past ${p.pos} claims at ${projNow != null && projNow > 0 ? `Sleeper's week ${fromWeek} projection (${projNow}), what other managers see` : `his starter-level price (${priced?.pts})`}. ${s.basis}` : s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
 								: { bid: null, basis: x == null ? "no recent usage data (and no confirmed-starter headline to price from)" : `no ${p.pos} claims in this league yet` }),
 						...(() => {
 							const avgOver = (ids: string[], ms: typeof byWeek) => (ms.length ? ms.reduce((a, m) => a + optimalLineup(ids, slots, m).total, 0) / ms.length : 0);
