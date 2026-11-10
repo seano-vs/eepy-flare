@@ -202,3 +202,12 @@ export function newsLine(n: Pick<NewsItem, "title" | "source" | "age_hours" | "p
 export function practiceLine(p: PracticeNews): string {
 	return `${p.practice}${p.day ? ` ${p.day}` : ""} (${p.source}, ${p.published_et ? `${p.published_et}, ` : ""}${p.age_hours}h ago)`;
 }
+
+/** Reported starts, not speculation ("could start", "may start" don't count). */
+const CONFIRMED_START = /\b(set to start|will start|expected to start|in line to start|named (the )?starter|named (the )?\w+ (starting|starter)|named \w+ starting|(set|slated|poised|expected) to take over|tak(es|ing) over as|to start (week|sunday|monday|thursday))\b/i;
+const SPECULATIVE = /\b(could|may|might|possible|possibly|potential|competing|in the mix|if)\b/i;
+
+/** True when a headline reports that the player will start (pricing uses it). Pure; exported for tests. */
+export function confirmedStart(title: string): boolean {
+	return CONFIRMED_START.test(title) && !SPECULATIVE.test(title);
+}

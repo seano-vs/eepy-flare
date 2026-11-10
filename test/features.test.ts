@@ -246,3 +246,25 @@ describe("fixPublished", () => {
 		expect(fixPublished(now - 60_000, "rotoballer", now)).toBe(now - 60_000);
 	});
 });
+
+describe("confirmedStart (real 2026 headlines)", () => {
+	it("prices reported starts, not speculation or other news", async () => {
+		const { confirmedStart } = await import("../src/news");
+		const yes = [
+			"Carson Beck set to start Week 10",
+			"Carson Beck - Set to take over as QB1",
+			"Gardner Minshew II named Cardinals starting QB",
+			"Gardner Minshew - Taking over as starting quarterback",
+			"Joe Fagnano - Still in line to start Thursday",
+		];
+		const no = [
+			"Carson Beck Becomes Deep-League Stash Option",
+			"Shedeur Sanders could start in Week 9",
+			"Drew Lock Says He'll Play Next Week vs. Raiders",
+			"Shedeur Sanders Shines With a QB5 Finish in Week 9, Boosts Dynasty Stock",
+			"Gardner Minshew II (elbow) potentially out for the season with torn-UCL",
+		];
+		expect(yes.filter((t) => !confirmedStart(t))).toEqual([]);
+		expect(no.filter((t) => confirmedStart(t))).toEqual([]);
+	});
+});

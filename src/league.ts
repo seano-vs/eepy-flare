@@ -64,6 +64,17 @@ export class LeagueContext {
 		return Math.max(1, Number(st.display_week ?? st.week) || 1);
 	}
 
+	/**
+	 * The next week to be played. Sleeper's display_week (what week shows) stays on the finished week
+	 * until Wednesday, while state.week has already moved on (Tue Nov 10, 2026: display_week 9, week 10).
+	 * Forward-looking pricing (FAAB value) uses this so it isn't valued against a week already played.
+	 */
+	get upcomingWeek(): number {
+		const st = this.state;
+		if (st.season_type !== "regular" && st.season_type !== "post") return 1;
+		return Math.max(this.week, Number(st.week) || this.week);
+	}
+
 	get seasonType(): string {
 		return "regular";
 	}

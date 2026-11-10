@@ -10,7 +10,7 @@ import { isUnavailable, playerContext } from "./nflverse/context";
 import { waiverSchedule, waiverStatuses } from "./waivers";
 import { rankWaiverTargets } from "./waiver-targets";
 import { readPrefs } from "./prefs";
-import { latestHeadlines, newsLine, playerNews, roleSignal } from "./news";
+import { confirmedStart, latestHeadlines, newsLine, playerNews, roleSignal } from "./news";
 import { NflData, expectedPoints } from "./nflverse/stats";
 import { READ_ONLY, fail, fmt, ok } from "./result";
 import { computeReplacement, lastFantasyWeek, optimalLineup, round, weekPool, type SkillPos } from "./scoring";
@@ -355,13 +355,15 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 				const slots = lc.league.roster_positions.filter((x) => x !== "BN");
 				const lastWeek = lastFantasyWeek(lc.league);
 				const playoffStart = Number(lc.league.settings.playoff_week_start) || 15;
+				// From the next week to be played (Sleeper's display week lags until Wednesday).
+				const fromWeek = lc.upcomingWeek;
 				const [{ byWeek, current }, season] = await Promise.all([
-					nearTermPpg(lc, lc.week, Math.min(4, Math.max(1, lastWeek - lc.week + 1))),
+					nearTermPpg(lc, fromWeek, Math.min(4, Math.max(1, lastWeek - fromWeek + 1))),
 					loadSeason(lc).catch(() => null),
 				]);
 				const myOdds = season?.schedule.length ? (runOdds(lc, season).odds.get(me.roster_id)?.playoffs ?? 0) / 100 : 1;
-				const regLeft = Math.max(0, playoffStart - lc.week);
-				const playoffWeeks = Math.max(0, lastWeek - Math.max(lc.week, playoffStart) + 1);
+				const regLeft = Math.max(0, playoffStart - fromWeek);
+				const playoffWeeks = Math.max(0, lastWeek - Math.max(fromWeek, playoffStart) + 1);
 				const weeksCounted = round(regLeft + playoffWeeks * myOdds, 1);
 				const activeOf = (r: Roster) => {
 					const res = new Set([...(r.reserve ?? []), ...(r.taxi ?? [])]);
@@ -383,7 +385,7 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 							.sort((a, b) => a - b)
 					: [];
 				const dollarsPerPoint = rates.length ? round(quantile(rates, 0.5), 3) : 0.5;
-				const reserve = reserveFor(myLeft, lastWeek - lc.week);
+				const reserve = reserveFor(myLeft, lastWeek - fromWeek);
 				const needsDrop = (me.players ?? []).length - (me.reserve ?? []).length - (me.taxi ?? []).length >= lc.league.roster_positions.length;
 				// Lowest-value droppable player: smallest drop in your best lineup, never an untouchable.
 				const dropCandidate = needsDrop
@@ -393,17 +395,54 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 							.sort((a, b) => a.loss - b.loss)[0]
 					: undefined;
 				const teamName = (rid: number) => lc.team(rid).team_name ?? lc.team(rid).owner;
+				// A confirmed new starter whose projection hasn't caught up (Carson Beck, week 10: "set to start",
+				// no Sleeper projection, no usage) is priced at what Sleeper projected his team's previous starter
+				// at that position in the most recent week it projected one (this week, else the two before; a
+				// bye leaves a gap: Arizona's week 8): the role he's stepping into.
+				const recentWeeks = [fromWeek, fromWeek - 1, fromWeek - 2].filter((w) => w >= 1);
+				const recentPools = await Promise.all(recentWeeks.map((w) => weekPool(lc.env.PLAYERS, lc.league, lc.season, w, lc.seasonType).catch(() => [])));
+				const headlineOf = (sid: string) => rankedBy.get(sid)?.news ?? (player ? singleNews[0] : undefined);
+				const starterPrice = (sid: string): { pts: number; basis: string } | null => {
+					const p = lc.players.get(sid);
+					const n = headlineOf(sid);
+					if (!p?.team || !n || !confirmedStart(n.title)) return null;
+					let incumbent: { id: string; pts: number } | undefined;
+					let prevWeek = 0;
+					for (const [i, pool] of recentPools.entries()) {
+						const top = pool.filter((e) => e.id !== sid && e.pos === p.pos && e.pts > 0 && lc.players.get(e.id)?.team === p.team).sort((a, b) => b.pts - a.pts)[0];
+						if (top) {
+							incumbent = top;
+							prevWeek = recentWeeks[i]!;
+							break;
+						}
+					}
+					if (!incumbent) return null;
+					const proj = byWeek[0]?.get(sid)?.pts ?? null;
+					if (proj != null && proj >= 0.8 * incumbent.pts) return null;
+					return {
+						pts: round(incumbent.pts, 1),
+						basis: `Headline "${n.title}" (${n.source}, ${n.age_hours}h ago) says he starts, but Sleeper projects ${proj == null ? "nothing" : proj} for him. Priced at ${fmt(lc.ref(incumbent.id))}'s week ${prevWeek} projection (${round(incumbent.pts, 1)}), his team's previous ${p.pos}1. An assumption: check the starter news before bidding.`,
+					};
+				};
 				const advice = targets.map((sid) => {
 					const p = lc.players.get(sid)!;
-					const x = xfpWindow(sid, from, latest);
+					const priced = starterPrice(sid);
+					const xUsage = xfpWindow(sid, from, latest);
+					// Without usage (a new starter), comparable claims are matched on his starter-level price, else on
+					// this week's projection, instead of returning no bid.
+					const projNow = byWeek[0]?.get(sid)?.pts ?? null;
+					const x = xUsage ?? priced?.pts ?? (projNow != null && projNow > 0 ? projNow : null);
 					const s = x != null ? suggestBid(p.pos, x, history, myLeft) : null;
+					// Weekly projections with his priced role, for lineup value.
+					const weeks = priced ? byWeek.map((m) => new Map(m).set(sid, { pos: p.pos, pts: priced.pts })) : byWeek;
 					const c = ctx.get(sid);
 					return {
 						player: fmt(p),
 						league_status: owned.has(sid) ? lc.team(owned.get(sid)!).owner : waivers.get(sid)?.status === "on waivers" ? `on waivers until ${waivers.get(sid)!.clears_after} (claim)` : "free agent",
 						...(waivers.get(sid) ? { waiver: waivers.get(sid) } : {}),
 						...(rankedBy.get(sid)?.proj_week != null ? { proj_week: rankedBy.get(sid)!.proj_week } : {}),
-						...(x != null ? { xfp_recent: round(x, 1) } : {}),
+						...(xUsage != null ? { xfp_recent: round(xUsage, 1) } : {}),
+						...(priced ? { priced_as_starter: { projection: priced.pts, basis: priced.basis } } : {}),
 						...(() => {
 							const n = rankedBy.get(sid)?.news ?? singleNews[0];
 							const sig = rankedBy.get(sid)?.role_news ?? (n ? roleSignal(n.title) : null);
@@ -414,17 +453,18 @@ export function registerAdvisorTools(server: McpServer, env: Env): void {
 						...(waivers.get(sid)?.status === "free agent" && !owned.has(sid)
 							? { bid: null, add_now: "Free agent: his game hasn't kicked off and he wasn't just dropped, so add him now for $0 before someone else does." }
 							: s
-								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
-								: { bid: null, basis: x == null ? "no recent usage data" : `no ${p.pos} claims in this league yet` }),
+								? { bid: { low: s.low, likely: s.likely, aggressive: s.aggressive }, basis: xUsage == null ? `No usage yet: matched to past ${p.pos} claims at his ${priced ? `starter-level price (${priced.pts})` : `week ${fromWeek} projection (${projNow})`}. ${s.basis}` : s.basis, ...(player ? { comps: s.comps } : {}), teams_that_can_outbid_likely: others.filter((b) => b > s.likely).length }
+								: { bid: null, basis: x == null ? "no recent usage data (and no confirmed-starter headline to price from)" : `no ${p.pos} claims in this league yet` }),
 						...(() => {
-							const gain = round(lineupAvg([...myActive, sid]) - myBase, 1);
+							const avgOver = (ids: string[], ms: typeof byWeek) => (ms.length ? ms.reduce((a, m) => a + optimalLineup(ids, slots, m).total, 0) / ms.length : 0);
+							const gain = round(avgOver([...myActive, sid], weeks) - avgOver(myActive, weeks), 1);
 							const yourMax = valueBid(gain, weeksCounted, dollarsPerPoint, myLeft, reserve);
 							const share = (b: number) => (myLeft ? Math.round((b / myLeft) * 100) : 0);
 							const fa = waivers.get(sid)?.status === "free agent" && !owned.has(sid);
 							const m = fa ? null : s;
 							const market = m?.likely ?? null;
 							// Rivals: can afford the likely bid and would start him this week.
-							const wk = byWeek[0];
+							const wk = weeks[0];
 							const rivals = wk
 								? lc.rosters
 										.filter((r) => r.roster_id !== me.roster_id && remaining(r) > (market ?? 0))
